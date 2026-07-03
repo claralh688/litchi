@@ -411,13 +411,9 @@ def _decide_action_impl(
     if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
         if phase == "RUSH":
             action = make_verify_gate_action(current_node_id)
-            for node in inquire_nodes:
-                if node.get("nodeId") == gate_node_id:
-                    guard = node.get("guard")
-                    if is_enemy_guard(guard, my_team_id, player_id):
-                        if get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1:
-                            action["rushTactic"] = "BREAK_ORDER"
-                    break
+            if get_bad_fruit(player) >= 2 or get_good_fruit(player) >= 1:
+                action["rushTactic"] = "BREAK_ORDER"
+                logger.info("Round %d: VERIFY_GATE with BREAK_ORDER at %s", round_num, current_node_id)
             return make_action(match_id, round_num, player_id, [action])
         # Not RUSH yet: don't submit VERIFY_GATE (will be rejected)
         # Continue doing other things until RUSH
