@@ -1621,8 +1621,8 @@ def _handle_combat(
         squad_count = get_squad_count(player)
         my_task_score = get_task_score(player)
 
-        # SQUAD_SCOUT: 仅任务分不足且小分队充裕时偶尔探路
-        if squad_count >= 5 and my_task_score < TASK_SCORE_TARGET and process_nodes:
+        # Reserve squads for late key-pass guard weakening; scouting is optional.
+        if squad_count >= 10 and my_task_score < TASK_SCORE_TARGET and process_nodes:
             for nid, info in process_nodes.items():
                 if nid not in visited_node_ids and nid != current_node_id:
                     dist = graph.path_length(current_node_id, nid, weather, None)
@@ -1633,7 +1633,7 @@ def _handle_combat(
                         ])
 
         # SQUAD_CLEAR: Clear obstacles without main team (策略文档 §8.4: 2人手)
-        if squad_count >= 2:
+        if squad_count >= 8:
             for node in inquire_nodes:
                 if node.get("hasObstacle", False) and node.get("nodeId") != current_node_id:
                     nid = node.get("nodeId", "")
@@ -1647,7 +1647,7 @@ def _handle_combat(
                             ])
 
         # SQUAD_REINFORCE: Reinforce our own guard at key nodes (策略文档 §8.4: 2人手)
-        if squad_count >= 2:
+        if squad_count >= 8:
             for node in inquire_nodes:
                 guard = node.get("guard", {})
                 owner_team = guard.get("ownerTeamId") if guard else ""
