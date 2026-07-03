@@ -48,6 +48,7 @@ class GameClient:
         self.pending_task_hold_until_round = 0
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
+        self.forced_pass_failed_targets: set[str] = set()  # targets where blind forced pass was rejected this stop
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
@@ -171,6 +172,7 @@ class GameClient:
                 self.pending_task_hold_task_id = ""
                 self.pending_task_hold_node_id = ""
                 self.pending_task_hold_until_round = 0
+            self.forced_pass_failed_targets.clear()
             self.guard_blocked_targets.discard(current_node_id)
             self.avoid_route_nodes.discard(current_node_id)
             self.last_node_id = current_node_id
@@ -252,6 +254,16 @@ class GameClient:
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
+                    if ar.get("action") == "FORCED_PASS" and last_error in {
+                        "TARGET_NOT_FOUND",
+                        "TARGET_NOT_REACHABLE",
+                        "ACTION_REJECTED",
+                        "FORCED_PASS_REPEAT",
+                    }:
+                        target = ar.get("targetNodeId", "")
+                        if target:
+                            self.forced_pass_failed_targets.add(target)
+                            logger.info("Round %d: FORCED_PASS %s rejected (%s), will try normal move", inquire.round, target, last_error)
                     if last_error == "MOVE_BLOCKED_BY_GUARD":
                         target = ar.get("targetNodeId") or player.get("nextNodeId", "")
                         if target:
@@ -296,6 +308,16 @@ class GameClient:
                     )
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
+                if payload.get("action") == "FORCED_PASS" and last_error in {
+                    "TARGET_NOT_FOUND",
+                    "TARGET_NOT_REACHABLE",
+                    "ACTION_REJECTED",
+                    "FORCED_PASS_REPEAT",
+                }:
+                    target = payload.get("targetNodeId", "")
+                    if target:
+                        self.forced_pass_failed_targets.add(target)
+                        logger.info("Round %d: FORCED_PASS %s rejected from event (%s), will try normal move", inquire.round, target, last_error)
                 if last_error == "MOVE_BLOCKED_BY_GUARD":
                     target = payload.get("targetNodeId") or player.get("nextNodeId", "")
                     if target:
@@ -400,6 +422,7 @@ class GameClient:
             pending_task_hold_task_id=self.pending_task_hold_task_id,
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
+            forced_pass_failed_targets=self.forced_pass_failed_targets,
         )
 
         self.send_message(action_msg)

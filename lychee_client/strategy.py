@@ -109,6 +109,7 @@ def decide_action(
     pending_task_hold_task_id: str = "",
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
+    forced_pass_failed_targets: set[str] | None = None,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -136,6 +137,8 @@ def decide_action(
         guard_blocked_targets = set()
     if avoid_route_nodes is None:
         avoid_route_nodes = set()
+    if forced_pass_failed_targets is None:
+        forced_pass_failed_targets = set()
 
     try:
         return _decide_action_impl(
@@ -146,6 +149,7 @@ def decide_action(
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
+            forced_pass_failed_targets,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -181,11 +185,14 @@ def _decide_action_impl(
     pending_task_hold_task_id: str = "",
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
+    forced_pass_failed_targets: set[str] | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
     if avoid_route_nodes is None:
         avoid_route_nodes = set()
+    if forced_pass_failed_targets is None:
+        forced_pass_failed_targets = set()
 
     # --- P0: Stability ---
     if is_retired(player) or is_delivered(player):
@@ -525,6 +532,12 @@ def _decide_action_impl(
                 )
                 if blocker_action.get("msg_data", {}).get("actions"):
                     return blocker_action
+            choke_action = _handle_key_choke_forced_pass(
+                match_id, round_num, player_id,
+                current_node_id, direct_target, forced_pass_failed_targets,
+            )
+            if choke_action is not None:
+                return choke_action
             logger.info("Round %d: FORCE_DELIVERY move to %s (goal=%s)", round_num, direct_target, gate_node_id)
             return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -773,6 +786,23 @@ def _handle_force_delivery_blocker(
             return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
     logger.info("Round %d: FORCE_DELIVERY forced pass blocked %s", round_num, target_node_id)
+    return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+
+
+def _handle_key_choke_forced_pass(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    current_node_id: str,
+    target_node_id: str,
+    forced_pass_failed_targets: set[str],
+) -> dict | None:
+    """Probe the S10 choke before committing to an edge where only WAIT is legal."""
+    if current_node_id != "S09" or target_node_id != "S10":
+        return None
+    if target_node_id in forced_pass_failed_targets:
+        return None
+    logger.info("Round %d: FORCE_DELIVERY forced pass probe at key choke %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
 
