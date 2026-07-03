@@ -24,12 +24,21 @@ ROUTE_FRESHNESS_LOSS = {
     "BRANCH": 0.065,
 }
 
-# Weather penalty multipliers (策略文档 §3.2)
+# Weather movement penalty multipliers (任务书 §2.3.2 / §2.5)
+# 酷暑 HOT 不影响通行倍率(1000)，只影响鲜度系数×1.5
 WEATHER_ROUTE_PENALTY = {
-    "HOT": {"MOUNTAIN": 1.5, "ROAD": 1.2},     # 酷暑: 山路鲜度×1.5
-    "HEAVY_RAIN": {"WATER": 1.5},               # 暴雨: 水路耗时×1.5
-    "MOUNTAIN_FOG": {"MOUNTAIN": 1.3},           # 山雾: 山路耗时×1.3
+    "HEAVY_RAIN": {"WATER": 1.35},    # 暴雨水路: 通行倍率 1350
+    "MOUNTAIN_FOG": {"MOUNTAIN": 1.1},  # 山雾山路: 通行倍率 1100
 }
+
+# 鲜度导向换路：酷暑时山路鲜度损耗×1.5，寻路加权惩罚（非移动倍率）
+WEATHER_FRESHNESS_ROUTE_PENALTY = {
+    "HOT": {"MOUNTAIN": 1.4, "BRANCH": 1.2},
+}
+
+# 暴雨命中时登船/水路换运处理 +4 帧 (任务书 §2.5)
+RAIN_EXTRA_PROCESS_TYPES = {"BOARD", "WATER_TRANSFER"}
+RAIN_EXTRA_PROCESS_FRAMES = 4
 
 # Process type cost in frames (策略文档 §4.1)
 PROCESS_COST_FRAMES = {
@@ -147,30 +156,34 @@ class MapGraph:
         # Cost in frame units: distance * routeCostFactor / 1000
         base_cost = distance * base_factor / 1000
 
-        # Apply weather penalty (协议: region=ALL/WATER/MOUNTAIN + type=HOT/HEAVY_RAIN/MOUNTAIN_FOG)
+        # Apply weather movement penalty (任务书 §2.5: HOT 不影响通行倍率)
         if weather:
             weather_events = list(weather.get("active", [])) + list(weather.get("forecast", []))
             for fw in weather_events:
                 weather_type = fw.get("type", "")
                 region = fw.get("region", "")
                 route_penalties = WEATHER_ROUTE_PENALTY.get(weather_type, {})
-                if not route_penalties:
-                    continue
-                if region == "ALL" or region == weather_type:
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "WATER" and route_type == "WATER":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
-                elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
-                    if route_type in route_penalties:
-                        base_cost *= route_penalties[route_type]
+                if route_penalties:
+                    if region in ("WATER", "HEAVY_RAIN") and route_type == "WATER":
+                        base_cost *= route_penalties.get("WATER", 1.0)
+                    elif region in ("MOUNTAIN", "MOUNTAIN_FOG") and route_type == "MOUNTAIN":
+                        base_cost *= route_penalties.get("MOUNTAIN", 1.0)
+                freshness_penalties = WEATHER_FRESHNESS_ROUTE_PENALTY.get(weather_type, {})
+                if freshness_penalties and route_type in freshness_penalties:
+                    if region in ("ALL", "HOT", weather_type):
+                        base_cost *= freshness_penalties[route_type]
 
-        # Add process cost penalty for the target node
+        # Add process cost penalty for the target node (含暴雨处理加时)
         if process_nodes and to_id in process_nodes:
             pt = process_nodes[to_id].get("processType", "")
-            if pt in PROCESS_COST_PENALTY:
-                base_cost += PROCESS_COST_PENALTY[pt]
+            proc_cost = PROCESS_COST_PENALTY.get(pt, 0)
+            if proc_cost and weather:
+                for fw in list(weather.get("active", [])) + list(weather.get("forecast", [])):
+                    if fw.get("type") == "HEAVY_RAIN" and pt in RAIN_EXTRA_PROCESS_TYPES:
+                        if fw.get("region") in ("WATER", "HEAVY_RAIN", "ALL"):
+                            proc_cost += RAIN_EXTRA_PROCESS_FRAMES
+                            break
+            base_cost += proc_cost
 
         return base_cost
 

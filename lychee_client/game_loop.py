@@ -431,6 +431,7 @@ class GameClient:
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
+            bounties=inquire.bounties,
         )
 
         self.send_message(action_msg)

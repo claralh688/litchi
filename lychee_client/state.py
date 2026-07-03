@@ -241,10 +241,28 @@ def get_blocked_nodes(
     return blocked
 
 
+def get_node_type(node: dict | None) -> str:
+    if not node:
+        return ""
+    return node.get("nodeType") or node.get("type", "")
+
+
+def is_key_pass_node(node: dict | None) -> bool:
+    return get_node_type(node) == "KEY_PASS"
+
+
+def find_node_by_id(nodes: list[dict], node_id: str) -> dict | None:
+    for node in nodes:
+        if node.get("nodeId") == node_id:
+            return node
+    return None
+
+
 def classify_opponent_mode(
     my_player: dict,
     opp_player: dict | None,
     phase: str,
+    gate_node_id: str = "",
 ) -> str:
     if is_delivered(my_player):
         return "DELIVERED"
@@ -256,13 +274,20 @@ def classify_opponent_mode(
     opp_score = opp_player.get("totalScore", 0)
     opp_task_score = opp_player.get("taskScore", 0)
 
-    my_node = my_player.get("currentNodeId", "")
-    opp_node = opp_player.get("currentNodeId", "")
-    if my_node == opp_node and my_node and phase == "RUSH":
-        return "GATE_FIGHT"
+    # 宫宴冲刺阶段双方争 S14 验核 (策略文档 §11)
+    if phase == "RUSH" and not is_verified(my_player):
+        my_node = my_player.get("currentNodeId", "")
+        opp_node = opp_player.get("currentNodeId", "")
+        if gate_node_id and (my_node == gate_node_id or opp_node == gate_node_id):
+            return "GATE_FIGHT"
+        if not is_verified(opp_player):
+            return "GATE_FIGHT"
 
     if my_score > opp_score:
         if opp_task_score < TASK_SCORE_TARGET:
             return "STEADY"
         return "CONSERVATIVE"
+
+    if opp_task_score >= TASK_SCORE_TARGET:
+        return "RACE"
     return "AGGRESSIVE"
