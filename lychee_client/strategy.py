@@ -212,6 +212,7 @@ def _decide_action_impl(
     for node in inquire_nodes:
         if node_has_obstacle(node):
             obstacle_nodes.add(node.get("nodeId", ""))
+    force_delivery = _should_force_delivery(round_num, phase, player)
 
     if is_in_limited_state(player):
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
@@ -241,6 +242,21 @@ def _decide_action_impl(
                     )
                 logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending WAIT", round_num, current_node_id)
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
+
+            if force_delivery and current_node_id and not next_node:
+                direct_target = _find_direct_delivery_step(
+                    graph, current_node_id, player, gate_node_id, terminal_node_ids,
+                    weather, process_nodes, processed_node_ids,
+                )
+                if direct_target:
+                    if direct_target in route_blocked or direct_target in obstacle_nodes:
+                        return _handle_force_delivery_blocker(
+                            match_id, round_num, player_id, player,
+                            direct_target, inquire_nodes, tasks, failed_task_ids,
+                            obstacle_nodes, my_team_id,
+                        )
+                    logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
+                    return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
             if guard_target:
                 return _wait_and_weaken_guard(
@@ -297,7 +313,6 @@ def _decide_action_impl(
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
     blocked_soft = route_blocked  # used for weighted routing and combat
-    force_delivery = _should_force_delivery(round_num, phase, player)
 
     # --- P1: Delivery flow (策略文档 §4.2 FSM) ---
 
@@ -606,9 +621,9 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     """Stop optional scoring once delivery risk is higher than task/resource value."""
     if phase == "RUSH":
         return True
-    if round_num >= 360:
+    if round_num >= 220:
         return True
-    return round_num >= 220 and get_task_score(player) >= TASK_SCORE_TARGET
+    return False
 
 
 def _find_direct_delivery_step(
