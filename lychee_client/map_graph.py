@@ -266,6 +266,22 @@ class MapGraph:
                     heapq.heappush(heap, (new_dist, neighbor))
         return []
 
+    def sum_path_cost(
+        self, path: list[str],
+        weather: dict | None = None,
+        blocked_nodes: set[str] | None = None,
+        process_nodes: dict[str, dict] | None = None,
+    ) -> float:
+        """Sum weighted edge costs along a path (frame-equivalent units)."""
+        if len(path) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(len(path) - 1):
+            total += self.edge_cost(
+                path[i], path[i + 1], weather, blocked_nodes, process_nodes,
+            )
+        return total
+
     def next_step_toward(
         self, from_id: str, to_id: str,
         weather: dict | None = None,

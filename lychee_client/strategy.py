@@ -384,6 +384,7 @@ def _decide_action_impl(
                     weather, route_blocked, obstacle_nodes=obstacle_nodes,
                     process_nodes=process_nodes,
                     processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                    round_num=round_num,
                 )
                 if move_target and move_target not in route_blocked:
                     return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -477,6 +478,7 @@ def _decide_action_impl(
                 graph, current_node_id, player, gate_node_id, terminal_node_ids,
                 weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
                 processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+                round_num=round_num,
             )
             if move_target:
                 return make_action(match_id, round_num, player_id, [make_move_action(move_target)])
@@ -616,6 +618,7 @@ def _decide_action_impl(
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
         visited_node_ids=set() if force_delivery else visited_node_ids,
+        round_num=round_num,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -1003,6 +1006,60 @@ def _handle_key_choke_horse(
     return None
 
 
+def _pick_cheapest_first_hop(
+    graph: MapGraph,
+    current_node_id: str,
+    goal_node: str,
+    available: list[str],
+    weather: dict | None,
+    soft_blocked: set[str],
+    remaining_process_nodes: dict[str, dict] | None,
+    avoid_routes: set[str] | None = None,
+    log_compare: bool = False,
+) -> str | None:
+    """Compare each available neighbor by total weighted cost to goal.
+
+    对每条宏观路线（官道/水路/山路）估算「本跳 + 后续最短路」总耗时，
+    自动偏好 WATER(1250) 低于 ROAD(1380) 的边，不写死节点编号。
+    """
+    best_neighbor = None
+    best_cost = float("inf")
+    comparisons: list[tuple[str, float, str]] = []
+
+    for n in available:
+        route_type = graph.get_edge_route_type(current_node_id, n)
+        if avoid_routes and route_type in avoid_routes:
+            continue
+        hop_cost = graph.edge_cost(
+            current_node_id, n, weather, soft_blocked, remaining_process_nodes,
+        )
+        if hop_cost == float("inf"):
+            continue
+        rest_path = graph.weighted_shortest_path(
+            n, goal_node, weather, soft_blocked, remaining_process_nodes,
+        )
+        if not rest_path:
+            continue
+        total = hop_cost + graph.sum_path_cost(
+            rest_path, weather, soft_blocked, remaining_process_nodes,
+        )
+        comparisons.append((n, total, route_type))
+        if total < best_cost:
+            best_cost = total
+            best_neighbor = n
+
+    if log_compare and comparisons:
+        comparisons.sort(key=lambda x: x[1])
+        logger.info(
+            "route compare at %s -> %s: %s (pick %s)",
+            current_node_id,
+            goal_node,
+            ", ".join(f"{nid}={cost:.1f}({rt})" for nid, cost, rt in comparisons),
+            best_neighbor,
+        )
+    return best_neighbor
+
+
 def _find_move_target(
     graph: MapGraph,
     current_node_id: str,
@@ -1016,6 +1073,7 @@ def _find_move_target(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
+    round_num: int = 0,
 ) -> str | None:
     """Find the best move target using weighted shortest path toward the current goal.
 
@@ -1055,9 +1113,6 @@ def _find_move_target(
         if not available:
             available = neighbors
 
-    goal_node = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
-
-    # Build remaining process nodes (exclude already-processed nodes at current visit)
     remaining_process_nodes = None
     if process_nodes:
         remaining_process_nodes = {
@@ -1065,15 +1120,30 @@ def _find_move_target(
             if nid not in processed_node_ids
         }
 
+    goal_node = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, remaining_process_nodes,
+    )
+
     if goal_node:
         # Build soft-blocked set: obstacles + visited + enemy guards
         soft_blocked = set(obstacle_nodes)
         soft_blocked.update(visited_node_ids)
         soft_blocked.update(guard_blocked)
-        # Don't block the goal itself
         soft_blocked.discard(goal_node)
 
-        # Use weighted Dijkstra first — prefers WATER(1250) over ROAD(1380) over MOUNTAIN(1780)
+        avoid_routes = _get_weather_penalized_routes(weather or {})
+        # 开局/分支点：逐邻居比较总加权耗时（含后续处理站），水路更快时自动选中
+        early_branch = round_num <= 80 or len(visited_node_ids) <= 4
+        step = _pick_cheapest_first_hop(
+            graph, current_node_id, goal_node, available, weather,
+            soft_blocked, remaining_process_nodes, avoid_routes,
+            log_compare=early_branch and len(available) > 1,
+        )
+        if step:
+            return step
+
+        # Fallback: Dijkstra 首跳
         step = graph.next_step_toward(current_node_id, goal_node, weather, soft_blocked, use_weighted=True, process_nodes=remaining_process_nodes)
         if step and step in available:
             return step
@@ -1089,24 +1159,6 @@ def _find_move_target(
         step = graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
         if step and step in available:
             return step
-        # Pick neighbor with lowest weighted cost to goal
-        best_alt = None
-        best_alt_cost = float('inf')
-        avoid_routes = _get_weather_penalized_routes(weather or {})
-        for n in available:
-            if avoid_routes:
-                rt = graph.get_edge_route_type(current_node_id, n)
-                if rt in avoid_routes:
-                    continue
-            path = graph.weighted_shortest_path(n, goal_node, weather, soft_blocked, remaining_process_nodes)
-            if path:
-                cost = sum(graph.edge_cost(path[i], path[i+1], weather, soft_blocked, remaining_process_nodes)
-                           for i in range(len(path)-1))
-                if cost < best_alt_cost:
-                    best_alt_cost = cost
-                    best_alt = n
-        if best_alt:
-            return best_alt
 
     # No goal: fall back to first available neighbor
     return available[0]
