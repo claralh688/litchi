@@ -42,12 +42,12 @@ RAIN_EXTRA_PROCESS_FRAMES = 4
 
 # Process type cost in frames (策略文档 §4.1)
 PROCESS_COST_FRAMES = {
-    "TRANSFER": 4,         # S02 前段交接
-    "BOARD": 7,            # S04 登船
-    "WATER_TRANSFER": 6,   # S05 水路换运
-    "PASS_TRANSFER": 5,    # S11 入关交接
-    "PALACE_TRANSFER": 5,  # S13 宫前交接
-    "VERIFY": 6,           # S14 宫门验核
+    "TRANSFER": 4,
+    "BOARD": 7,
+    "WATER_TRANSFER": 6,
+    "PASS_TRANSFER": 5,
+    "PALACE_TRANSFER": 5,
+    "VERIFY": 6,
 }
 
 # Process cost penalty for route selection — directly in frame units
@@ -293,3 +293,14 @@ class MapGraph:
         """Return the number of hops in the shortest path, or infinity if unreachable."""
         path = self.shortest_path(from_id, to_id, weather, blocked_nodes)
         return len(path) - 1 if path else float('inf')
+
+    def route_distance(self, from_id: str, to_id: str) -> int:
+        """沿最短路线边累计距离（任务书 §3.3.4 情报距离口径）。"""
+        path = self.shortest_path(from_id, to_id)
+        if not path or len(path) < 2:
+            return 999
+        total = 0
+        for i in range(len(path) - 1):
+            edge = self.get_edge(path[i], path[i + 1])
+            total += int(edge.get("distance", 30) if edge else 30)
+        return total

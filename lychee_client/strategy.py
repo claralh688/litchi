@@ -2,7 +2,7 @@
 
 Priority order per frame (策略文档 §14 伪代码):
   P0  Stable online, every-frame heartbeat, zero illegal actions
-  P1  Must deliver (goodFruit>0, freshness>0, verified, at S15)
+  P1  Must deliver (goodFruit>0, freshness>0, verified, at terminal)
   P2  Task score ≥ 90
   P3  Deliver early (time score)
   P4  Preserve good fruit & freshness
@@ -111,6 +111,8 @@ def decide_action(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    failed_intel_targets: set[str] | None = None,
+    scouted_node_ids: set[str] | None = None,
     bounties: list[dict] | None = None,
 ) -> dict:
     """Decide the action for the current round.
@@ -141,11 +143,16 @@ def decide_action(
         avoid_route_nodes = set()
     if forced_pass_failed_targets is None:
         forced_pass_failed_targets = set()
+    if failed_intel_targets is None:
+        failed_intel_targets = set()
+    if scouted_node_ids is None:
+        scouted_node_ids = set()
     if bounties is None:
         bounties = []
 
     try:
-        return _decide_action_impl(
+        deferred_scout: list[dict] = []
+        result = _decide_action_impl(
             match_id, round_num, player_id, player, graph,
             current_node, process_nodes, contests, events,
             active_contest_id, last_move_failed, last_move_error,
@@ -153,8 +160,12 @@ def decide_action(
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
             pending_task_hold_task_id, pending_task_hold_node_id, pending_task_hold_until_round,
-            forced_pass_failed_targets, bounties,
+            forced_pass_failed_targets, failed_intel_targets, scouted_node_ids, bounties,
+            deferred_scout,
         )
+        if deferred_scout:
+            return _append_squad_action(result, deferred_scout[0])
+        return result
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
         return make_empty_action(match_id, round_num, player_id)
@@ -190,7 +201,10 @@ def _decide_action_impl(
     pending_task_hold_node_id: str = "",
     pending_task_hold_until_round: int = 0,
     forced_pass_failed_targets: set[str] | None = None,
+    failed_intel_targets: set[str] | None = None,
+    scouted_node_ids: set[str] | None = None,
     bounties: list[dict] | None = None,
+    deferred_scout: list | None = None,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -198,8 +212,33 @@ def _decide_action_impl(
         avoid_route_nodes = set()
     if forced_pass_failed_targets is None:
         forced_pass_failed_targets = set()
+    if failed_intel_targets is None:
+        failed_intel_targets = set()
+    if scouted_node_ids is None:
+        scouted_node_ids = set()
     if bounties is None:
         bounties = []
+    if deferred_scout is None:
+        deferred_scout = []
+
+    # --- 小分队探路（与主车队共用导航目标，不写死节点编号）---
+    if phase != "RUSH" and not _should_force_delivery(round_num, phase, player):
+        squad_scout = _pick_squad_scout_target(
+            graph, get_current_node_id(player) or "", gate_node_id, terminal_node_ids,
+            process_nodes, processed_node_ids, visited_node_ids, scouted_node_ids,
+            weather, player,
+        )
+        if squad_scout:
+            scout_item = make_squad_scout_action(squad_scout)
+            state = player.get("state", "")
+            logger.info("Round %d: Squad scout at %s", round_num, squad_scout)
+            if state == "IDLE" and can_act(player):
+                deferred_scout.append(scout_item)
+            elif state in ("MOVING", "WAITING", "IDLE"):
+                return _append_squad_action(
+                    make_empty_action(match_id, round_num, player_id),
+                    scout_item,
+                )
 
     # --- P0: Stability ---
     if is_retired(player) or is_delivered(player):
@@ -308,7 +347,8 @@ def _decide_action_impl(
                     choke_action = _handle_key_choke_forced_pass(
                         match_id, round_num, player_id,
                         current_node_id, direct_target, forced_pass_failed_targets,
-                        inquire_nodes, graph,
+                        inquire_nodes, graph, route_blocked, obstacle_nodes,
+                        my_team_id, player_id,
                     )
                     if choke_action is not None:
                         return choke_action
@@ -402,20 +442,18 @@ def _decide_action_impl(
 
     # --- P1: Delivery flow (策略文档 §4.2 FSM) ---
 
-    # At S15: DELIVER if verified and can deliver
+    # At terminal: DELIVER if verified and can deliver
     if current_node_id in terminal_node_ids:
         if is_verified(player) and get_good_fruit(player) > 0 and get_freshness(player) > 0:
             return make_action(match_id, round_num, player_id, [make_deliver_action()])
-        # At S15 but not verified → go back to S14 (策略文档 §4.2: 无视设卡与障碍)
+        # 未验核则返回宫门（策略文档 §4.2: 无视设卡与障碍）
         if gate_node_id and not is_verified(player):
-            # Direct move to S14 — guards/obstacles don't block this path
             step = graph.next_step_toward(current_node_id, gate_node_id, weather, None)
             if step:
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
-        # At S15, verified but no good fruit/freshness → WAIT (can't deliver)
         return make_empty_action(match_id, round_num, player_id)
 
-    # At S14 (gate): VERIFY_GATE in RUSH phase
+    # At gate: VERIFY_GATE in RUSH phase
     if gate_node_id and is_at_node(player, gate_node_id) and not is_verified(player):
         if phase == "RUSH":
             action = make_verify_gate_action(current_node_id)
@@ -468,7 +506,7 @@ def _decide_action_impl(
             weather, blocked_soft, inquire_nodes, process_nodes=process_nodes,
         )
 
-    # --- P2/P3: Task strategy (策略文档 §5) ---
+    # --- P2: Task strategy (策略文档 §5) ---
     if not force_delivery:
         task_action = _handle_tasks(
             match_id, round_num, player_id, player, graph,
@@ -507,7 +545,8 @@ def _decide_action_impl(
     use_res_action = _handle_use_resources(
         match_id, round_num, player_id, player,
         current_node_id, graph, weather, phase, process_nodes,
-        processed_node_ids, visited_node_ids,
+        processed_node_ids, visited_node_ids, failed_intel_targets,
+        last_move_failed, last_move_error,
     )
     if use_res_action is not None:
         return use_res_action
@@ -558,7 +597,8 @@ def _decide_action_impl(
             choke_action = _handle_key_choke_forced_pass(
                 match_id, round_num, player_id,
                 current_node_id, direct_target, forced_pass_failed_targets,
-                inquire_nodes, graph,
+                inquire_nodes, graph, route_blocked, obstacle_nodes,
+                my_team_id, player_id,
             )
             if choke_action is not None:
                 return choke_action
@@ -678,6 +718,20 @@ def _get_weather_penalized_routes(weather: dict) -> set[str]:
     return avoid
 
 
+def _remaining_fixed_process_nodes(
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+) -> dict[str, dict]:
+    """未完成的固定处理站（排除验核站），供寻路与探路共用。"""
+    if not process_nodes:
+        return {}
+    return {
+        nid: info for nid, info in process_nodes.items()
+        if nid not in processed_node_ids
+        and not is_verify_process(info.get("processType"))
+    }
+
+
 def _get_process_type(
     current_node: dict | None,
     process_nodes: dict[str, dict] | None,
@@ -758,18 +812,29 @@ def _edge_distance(graph: MapGraph, from_id: str, to_id: str) -> int:
 
 
 def _node_coord_distance(graph: MapGraph, from_id: str, to_id: str) -> int:
-    """估算节点距离，用于情报探路上限。"""
-    a = graph.get_node(from_id) or {}
-    b = graph.get_node(to_id) or {}
-    if "x" in a and "y" in a and "x" in b and "y" in b:
-        return max(abs(int(a["x"]) - int(b["x"])), abs(int(a["y"]) - int(b["y"])))
-    path = graph.shortest_path(from_id, to_id)
-    if not path:
-        return 999
-    total = 0
-    for i in range(len(path) - 1):
-        total += _edge_distance(graph, path[i], path[i + 1])
-    return total
+    """沿路线边累计距离（任务书 §3.3.4，不用坐标直线距离）。"""
+    return graph.route_distance(from_id, to_id)
+
+
+def _target_needs_forced_pass(
+    target_node_id: str,
+    route_blocked: set[str],
+    obstacle_nodes: set[str],
+    inquire_nodes: list[dict],
+    my_team_id: str,
+    player_id: int,
+) -> bool:
+    """仅当相邻目标存在设卡或障碍时才需要强制通行。"""
+    if target_node_id in obstacle_nodes or target_node_id in route_blocked:
+        return True
+    for node in inquire_nodes:
+        if node.get("nodeId") != target_node_id:
+            continue
+        if node_has_obstacle(node):
+            return True
+        if is_enemy_guard(node.get("guard"), my_team_id, player_id):
+            return True
+    return False
 
 
 def _find_bounty_node(bounties: list[dict], my_team_id: str) -> str:
@@ -888,16 +953,26 @@ def _handle_key_choke_forced_pass(
     forced_pass_failed_targets: set[str],
     inquire_nodes: list[dict],
     graph: MapGraph | None = None,
+    route_blocked: set[str] | None = None,
+    obstacle_nodes: set[str] | None = None,
+    my_team_id: str = "",
+    my_player_id: int = 0,
 ) -> dict | None:
-    """关键关隘前探测强制通行（参数化，不写死节点）。"""
+    """关键关隘前：仅在有阻挡时尝试强制通行，失败则改普通移动。"""
     if graph is None:
         return None
+    if route_blocked is None:
+        route_blocked = set()
+    if obstacle_nodes is None:
+        obstacle_nodes = set()
     if not _is_approaching_key_pass(current_node_id, target_node_id, inquire_nodes, graph):
         return None
     if target_node_id in forced_pass_failed_targets:
-        if round_num < 550:
-            logger.info("Round %d: holding before key pass %s", round_num, target_node_id)
-            return make_action(match_id, round_num, player_id, [make_wait_action()])
+        return None
+    if not _target_needs_forced_pass(
+        target_node_id, route_blocked, obstacle_nodes,
+        inquire_nodes, my_team_id, my_player_id,
+    ):
         return None
     logger.info("Round %d: forced pass probe at key pass %s", round_num, target_node_id)
     return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
@@ -1306,7 +1381,7 @@ def _handle_blocked_by_guard(
     neighbors = graph.get_neighbors(current_node_id)
     goal = gate_node_id or (terminal_node_ids[0] if terminal_node_ids else "")
 
-    # Detour via unblocked neighbor (e.g. S09→S05 when S10 guarded)
+    # Detour via unblocked neighbor when direct hop is guarded
     best_detour = None
     best_cost = float("inf")
     for n in neighbors:
@@ -1602,7 +1677,7 @@ def _handle_resources(
     # Filter to only high-value resources worth claiming
     HIGH_VALUE_RESOURCES = {"FAST_HORSE", "SHORT_HORSE", "ICE_BOX"}
     WINDOW_RESOURCES = {"OFFICIAL_PERMIT", "PASS_TOKEN"}
-    # GUARD_RESERVE_FOR_GATE: reserve 1 permit for S14 GATE contest (策略文档 §15)
+    # GUARD_RESERVE_FOR_GATE: reserve 1 permit for gate contest (策略文档 §15)
     PERMIT_RESERVE = 1
 
     for rtype, count in resources:
@@ -1631,11 +1706,7 @@ def _handle_resources(
             return make_action(match_id, round_num, player_id, [
                 make_claim_resource_action(current_node_id, rtype)
             ])
-        if rtype == "INTEL" and my_resources.get("INTEL", 0) < 1:
-            logger.info("Round %d: Claiming INTEL at %s", round_num, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_claim_resource_action(current_node_id, rtype)
-            ])
+        # 不领取 INTEL：路线距离常超限，改用小分队探路
 
     return None
 
@@ -1680,24 +1751,86 @@ def _handle_force_delivery_resource(
     return None
 
 
+def _pick_squad_scout_target(
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+    visited_node_ids: set[str],
+    scouted_node_ids: set[str],
+    weather: dict | None,
+    player: dict,
+) -> str | None:
+    """沿主路线下一未探路的固定处理站派出小分队。
+
+    与 _find_move_target 共用 _get_goal_node 与加权最短路，不写死任何节点编号。
+    探路标记使处理帧 -3（任务书 §6.4.1），优先覆盖主车队即将到达的处理站。
+    """
+    if not current_node_id:
+        return None
+    remaining = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
+    if not remaining:
+        return None
+    if get_squad_count(player) < 2:
+        return None
+    if get_task_score(player) >= TASK_SCORE_STRETCH:
+        return None
+
+    goal = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, remaining,
+    )
+    if not goal:
+        return None
+
+    path = graph.weighted_shortest_path(
+        current_node_id, goal, weather, None, remaining,
+    )
+    if path:
+        for nid in path[1:]:
+            if nid in scouted_node_ids or nid in visited_node_ids:
+                continue
+            if nid in remaining:
+                return nid
+
+    # 分支地图：主路径上无候选时，选路线累计距离最近的未探路处理站
+    best_node = None
+    best_dist = float("inf")
+    for nid in remaining:
+        if nid in scouted_node_ids or nid in visited_node_ids:
+            continue
+        dist = graph.route_distance(current_node_id, nid)
+        if dist <= 0 or dist >= best_dist:
+            continue
+        best_dist = dist
+        best_node = nid
+    return best_node
+
+
 def _find_intel_target(
     graph: MapGraph,
     current_node_id: str,
     process_nodes: dict[str, dict] | None,
     processed_node_ids: set[str],
     visited_node_ids: set[str],
+    failed_intel_targets: set[str] | None = None,
 ) -> str | None:
-    """Find next unprocessed process node within INTEL range."""
-    if not process_nodes:
+    """Find next unprocessed process node within INTEL route distance limit."""
+    remaining = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
+    if not remaining:
         return None
+    if failed_intel_targets is None:
+        failed_intel_targets = set()
     best_node = None
     best_dist = float("inf")
-    for nid, info in process_nodes.items():
-        if is_verify_process(info.get("processType")):
+    for nid in remaining:
+        if nid in visited_node_ids:
             continue
-        if nid in processed_node_ids or nid in visited_node_ids:
+        if nid in failed_intel_targets:
             continue
-        dist = _node_coord_distance(graph, current_node_id, nid)
+        dist = graph.route_distance(current_node_id, nid)
         if dist <= INTEL_MAX_DISTANCE and dist < best_dist:
             best_dist = dist
             best_node = nid
@@ -1711,22 +1844,33 @@ def _handle_use_resources(
     process_nodes: dict[str, dict] | None = None,
     processed_node_ids: set[str] | None = None,
     visited_node_ids: set[str] | None = None,
+    failed_intel_targets: set[str] | None = None,
+    last_move_failed: bool = False,
+    last_move_error: str = "",
 ) -> dict | None:
     """Handle using resources: ice box, horses, intel (策略文档 §6.1)."""
     if processed_node_ids is None:
         processed_node_ids = set()
     if visited_node_ids is None:
         visited_node_ids = set()
+    if failed_intel_targets is None:
+        failed_intel_targets = set()
     freshness = get_freshness(player)
     force_delivery = _should_force_delivery(round_num, phase, player)
 
-    # Use INTEL to scout upcoming process nodes (任务书 §3.3.4, §6.4.1)
-    if has_resource(player, "INTEL") and not force_delivery:
+    # Use INTEL only when route distance ≤15 and target not blacklisted
+    if (
+        has_resource(player, "INTEL")
+        and not force_delivery
+        and not (last_move_failed and last_move_error == "TARGET_NOT_REACHABLE")
+    ):
         intel_target = _find_intel_target(
-            graph, current_node_id, process_nodes, processed_node_ids, visited_node_ids,
+            graph, current_node_id, process_nodes, processed_node_ids,
+            visited_node_ids, failed_intel_targets,
         )
         if intel_target:
-            logger.info("Round %d: Using INTEL on %s", round_num, intel_target)
+            logger.info("Round %d: Using INTEL on %s (route_dist=%d)", round_num, intel_target,
+                        graph.route_distance(current_node_id, intel_target))
             return make_action(match_id, round_num, player_id, [
                 make_use_resource_action("INTEL", intel_target)
             ])
@@ -1823,7 +1967,7 @@ def _handle_combat(
                     logger.info("Round %d: Breaking bounty guard at %s", round_num, bounty_node)
                     return make_action(match_id, round_num, player_id, [action])
 
-    # SET_GUARD: 领先时可设卡钓鱼；宫门争夺时守 S14
+    # SET_GUARD: 领先时可设卡钓鱼；宫门/关键关隘争夺时设卡
     should_set_guard = (
         mode == "GATE_FIGHT"
         or (phase == "RUSH" and gate_node_id and current_node_id == gate_node_id)
@@ -1872,20 +2016,6 @@ def _handle_combat(
     # --- Squad actions (策略文档 §8.4) — only if not RUSH ---
     if phase != "RUSH":
         squad_count = get_squad_count(player)
-        my_task_score = get_task_score(player)
-
-        # Reserve squads for weaken; scout when enough manpower remain
-        if squad_count >= 6 and my_task_score < TASK_SCORE_TARGET and process_nodes:
-            for nid, info in process_nodes.items():
-                if is_verify_process(info.get("processType")):
-                    continue
-                if nid not in visited_node_ids and nid != current_node_id:
-                    dist = graph.path_length(current_node_id, nid, weather, None)
-                    if 0 < dist <= INTEL_MAX_DISTANCE:
-                        logger.info("Round %d: Squad scout at %s", round_num, nid)
-                        return make_action(match_id, round_num, player_id, [
-                            make_squad_scout_action(nid)
-                        ])
 
         # SQUAD_CLEAR: Clear obstacles without main team (策略文档 §8.4: 2人手)
         if squad_count >= 8:

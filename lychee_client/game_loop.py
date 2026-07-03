@@ -49,6 +49,9 @@ class GameClient:
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
         self.forced_pass_failed_targets: set[str] = set()  # targets where blind forced pass was rejected this stop
+        self.failed_intel_targets: set[str] = set()  # INTEL targets rejected with TARGET_NOT_REACHABLE
+        self.scouted_node_ids: set[str] = set()  # nodes already sent SQUAD_SCOUT to
+        self.last_intel_target = ""
         self.last_forced_pass_target = ""
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
@@ -274,6 +277,14 @@ class GameClient:
                         if target:
                             self.guard_blocked_targets.add(target)
                             logger.info("Round %d: Guard blocks %s, will reroute/break", inquire.round, target)
+                    if (
+                        ar.get("action") == "USE_RESOURCE"
+                        and last_error == "TARGET_NOT_REACHABLE"
+                    ):
+                        target = ar.get("targetNodeId", "") or self.last_intel_target
+                        if target:
+                            self.failed_intel_targets.add(target)
+                            logger.info("Round %d: INTEL target %s unreachable, blacklisting", inquire.round, target)
 
         # Also check events for rejections and cache contest info
         for ev in inquire.events:
@@ -330,6 +341,14 @@ class GameClient:
                     target = payload.get("targetNodeId") or player.get("nextNodeId", "")
                     if target:
                         self.guard_blocked_targets.add(target)
+                if (
+                    payload.get("action") == "USE_RESOURCE"
+                    and last_error == "TARGET_NOT_REACHABLE"
+                ):
+                    target = payload.get("targetNodeId", "") or self.last_intel_target
+                    if target:
+                        self.failed_intel_targets.add(target)
+                        logger.info("Round %d: INTEL target %s unreachable (event), blacklisting", inquire.round, target)
             if ev_type == "GUARD_BREAK":
                 node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
                 if node_id:
@@ -431,6 +450,8 @@ class GameClient:
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
             forced_pass_failed_targets=self.forced_pass_failed_targets,
+            failed_intel_targets=self.failed_intel_targets,
+            scouted_node_ids=self.scouted_node_ids,
             bounties=inquire.bounties,
         )
 
@@ -451,6 +472,13 @@ class GameClient:
             self.last_claimed_task_id = actions[0].get("taskId", "")
             self.last_claimed_task_node_id = current_node_id or ""
         self.last_forced_pass_target = actions[0].get("targetNodeId", "") if action_type == "FORCED_PASS" else ""
+        if action_type == "USE_RESOURCE" and actions[0].get("resourceType") == "INTEL":
+            self.last_intel_target = actions[0].get("targetNodeId", "")
+        for act in actions:
+            if act.get("action") == "SQUAD_SCOUT":
+                target = act.get("targetNodeId", "")
+                if target:
+                    self.scouted_node_ids.add(target)
         if action_type == "MOVE":
             self.move_count += 1
         elif action_type in ("PROCESS", "DOCK", "VERIFY_GATE"):
