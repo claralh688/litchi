@@ -171,6 +171,8 @@ class GameClient:
                 self.pending_task_hold_task_id = ""
                 self.pending_task_hold_node_id = ""
                 self.pending_task_hold_until_round = 0
+            self.guard_blocked_targets.discard(current_node_id)
+            self.avoid_route_nodes.discard(current_node_id)
             self.last_node_id = current_node_id
             self.visited_node_ids.add(current_node_id)
 
