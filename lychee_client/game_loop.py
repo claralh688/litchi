@@ -234,15 +234,13 @@ class GameClient:
                         logger.info("Round %d: RUSH_SPEED rejected as INVALID_ACTION_TYPE, disabling", inquire.round)
                     # Track CLAIM_TASK business rejections that should not be retried.
                     # Note: actionResults doesn't include taskId, use last_claimed_task_id
-                    if (
-                        ar.get("action") == "CLAIM_TASK"
-                        and last_error in {
+                    if ar.get("action") == "CLAIM_TASK" and last_error in {
                             "RESOURCE_NOT_ENOUGH",
                             "TASK_REQUIREMENT_NOT_MET",
                             "TASK_EXPIRED",
                             "WINDOW_DRAW_RETRY_LIMIT",
-                        }
-                    ):
+                            "TASK_NOT_FOUND",
+                        }:
                         failed_tid = self.last_claimed_task_id
                         if failed_tid:
                             self.failed_task_ids.add(failed_tid)
@@ -251,14 +249,24 @@ class GameClient:
                             self.pending_task_hold_until_round = 0
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                        self.pending_task_hold_task_id = self.last_claimed_task_id
-                        self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
-                        self.pending_task_hold_until_round = inquire.round + 6
+                        failed_tid = self.last_claimed_task_id
+                        if failed_tid:
+                            self.failed_task_ids.add(failed_tid)
+                        self.pending_task_hold_task_id = ""
+                        self.pending_task_hold_node_id = ""
+                        self.pending_task_hold_until_round = 0
                         logger.info(
-                            "Round %d: Task %s busy at %s, holding until round %d",
-                            inquire.round, self.last_claimed_task_id,
-                            self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                            "Round %d: Task %s busy at %s, skip and move on",
+                            inquire.round, failed_tid or "?",
+                            self.last_claimed_task_node_id or current_node_id or "",
                         )
+                    if ar.get("action") in ("PROCESS", "DOCK") and last_error == "OBJECT_BUSY":
+                        if current_node_id:
+                            self.processed_node_ids.add(current_node_id)
+                            logger.info(
+                                "Round %d: Process busy at %s, skip and continue route",
+                                inquire.round, current_node_id,
+                            )
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
@@ -307,6 +315,7 @@ class GameClient:
                         "TASK_REQUIREMENT_NOT_MET",
                         "TASK_EXPIRED",
                         "WINDOW_DRAW_RETRY_LIMIT",
+                        "TASK_NOT_FOUND",
                     }
                 ):
                     failed_tid = self.last_claimed_task_id
@@ -317,14 +326,24 @@ class GameClient:
                         self.pending_task_hold_until_round = 0
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                    self.pending_task_hold_task_id = self.last_claimed_task_id
-                    self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
-                    self.pending_task_hold_until_round = inquire.round + 6
+                    failed_tid = self.last_claimed_task_id
+                    if failed_tid:
+                        self.failed_task_ids.add(failed_tid)
+                    self.pending_task_hold_task_id = ""
+                    self.pending_task_hold_node_id = ""
+                    self.pending_task_hold_until_round = 0
                     logger.info(
-                        "Round %d: Task %s busy at %s (from event), holding until round %d",
-                        inquire.round, self.last_claimed_task_id,
-                        self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                        "Round %d: Task %s busy at %s (from event), skip and move on",
+                        inquire.round, failed_tid or "?",
+                        self.last_claimed_task_node_id or current_node_id or "",
                     )
+                if payload.get("action") in ("PROCESS", "DOCK") and last_error == "OBJECT_BUSY":
+                    if current_node_id:
+                        self.processed_node_ids.add(current_node_id)
+                        logger.info(
+                            "Round %d: Process busy at %s (from event), skip and continue",
+                            inquire.round, current_node_id,
+                        )
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
                 if (

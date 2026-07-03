@@ -282,9 +282,6 @@ def _decide_action_impl(
 
         if state == "WAITING":
             next_node = player.get("nextNodeId", "")
-            if last_move_failed and last_move_error == "OBJECT_BUSY":
-                logger.info("Round %d: OBJECT_BUSY in WAITING, sending WAIT", round_num)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             pending_process_type = _get_pending_station_process_type(
                 current_node_id, next_node, process_nodes, processed_node_ids,
@@ -293,11 +290,37 @@ def _decide_action_impl(
                 if _has_current_process_for_node(player, current_node_id):
                     logger.info("Round %d: station process running at %s, sending empty action", round_num, current_node_id)
                     return make_empty_action(match_id, round_num, player_id)
-                logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
-                return _make_process_action(
-                    match_id, round_num, player_id,
-                    pending_process_type, current_node_id, phase,
-                )
+                if last_move_failed and last_move_error == "OBJECT_BUSY":
+                    logger.info(
+                        "Round %d: station process busy at %s, skip %s and move on",
+                        round_num, current_node_id, pending_process_type,
+                    )
+                    if current_node_id:
+                        processed_node_ids.add(current_node_id)
+                    if not next_node:
+                        move_target = _find_move_target(
+                            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+                            weather, route_blocked, obstacle_nodes=obstacle_nodes,
+                            process_nodes=process_nodes,
+                            processed_node_ids=processed_node_ids,
+                            visited_node_ids=visited_node_ids,
+                            round_num=round_num, came_from_node_id=came_from_node_id,
+                        )
+                        if move_target and move_target not in route_blocked:
+                            move_action = _emit_move_action(
+                                match_id, round_num, player_id, current_node_id, move_target,
+                                graph, gate_node_id, terminal_node_ids, player, weather,
+                                process_nodes, processed_node_ids, obstacle_nodes,
+                                visited_node_ids, came_from_node_id,
+                            )
+                            if move_action is not None:
+                                return move_action
+                else:
+                    logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
+                    return _make_process_action(
+                        match_id, round_num, player_id,
+                        pending_process_type, current_node_id, phase,
+                    )
 
             if last_move_failed and last_move_error == "PROCESS_REQUIRED":
                 process_type = process_nodes.get(current_node_id, {}).get("processType") if process_nodes and current_node_id else ""
@@ -311,23 +334,6 @@ def _decide_action_impl(
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if not force_delivery and current_node_id and not next_node:
-                if (
-                    pending_task_hold_node_id == current_node_id
-                    and round_num <= pending_task_hold_until_round
-                ):
-                    logger.info(
-                        "Round %d: waiting for busy task at %s until %d",
-                        round_num, current_node_id, pending_task_hold_until_round,
-                    )
-                    return make_action(match_id, round_num, player_id, [make_wait_action()])
-                if pending_task_hold_node_id == current_node_id and pending_task_hold_task_id:
-                    task_retry = _retry_task_at_current_node(
-                        match_id, round_num, player_id, player, graph,
-                        current_node_id, tasks, failed_task_ids,
-                        preferred_task_id=pending_task_hold_task_id,
-                    )
-                    if task_retry is not None:
-                        return task_retry
                 task_retry = _retry_task_at_current_node(
                     match_id, round_num, player_id, player, graph,
                     current_node_id, tasks, failed_task_ids,
@@ -378,8 +384,11 @@ def _decide_action_impl(
                 )
 
             if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
-                logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
+                if force_delivery or round_num >= 300:
+                    logger.info("Round %d: %s in WAITING, continue route", round_num, last_move_error)
+                else:
+                    logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
+                    return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if next_node:
                 if next_node in route_blocked:
@@ -438,29 +447,6 @@ def _decide_action_impl(
     if current_node_id is None:
         return make_empty_action(match_id, round_num, player_id)
 
-    if (
-        not force_delivery
-        and pending_task_hold_node_id == current_node_id
-        and round_num <= pending_task_hold_until_round
-    ):
-        logger.info(
-            "Round %d: holding at %s for busy task until %d",
-            round_num, current_node_id, pending_task_hold_until_round,
-        )
-        return make_action(match_id, round_num, player_id, [make_wait_action()])
-    if (
-        not force_delivery
-        and pending_task_hold_node_id == current_node_id
-        and pending_task_hold_task_id
-    ):
-        task_retry = _retry_task_at_current_node(
-            match_id, round_num, player_id, player, graph,
-            current_node_id, tasks, failed_task_ids,
-            preferred_task_id=pending_task_hold_task_id,
-        )
-        if task_retry is not None:
-            return task_retry
-
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
     blocked_soft = route_blocked  # used for weighted routing and combat
@@ -504,6 +490,11 @@ def _decide_action_impl(
         and not is_delivered(player)
         and terminal_node_ids
     ):
+        if not _has_active_speed_buff(player) and has_resource(player, "FAST_HORSE"):
+            logger.info("Round %d: Using FAST_HORSE before delivery move", round_num)
+            return make_action(match_id, round_num, player_id, [
+                make_use_resource_action("FAST_HORSE")
+            ])
         for tid in terminal_node_ids:
             if tid in graph.get_neighbors(current_node_id):
                 move_action = _emit_move_action(
@@ -526,7 +517,11 @@ def _decide_action_impl(
     process_type = None if already_processed_here else _get_process_type(current_node, process_nodes, current_node_id)
 
     if process_type:
-        if last_move_failed and "WINDOW" in last_move_error.upper():
+        if last_move_failed and last_move_error == "OBJECT_BUSY":
+            logger.info("Round %d: Process busy at %s, skip and move on", round_num, current_node_id)
+            processed_node_ids.add(current_node_id)
+            process_type = None
+        elif last_move_failed and "WINDOW" in last_move_error.upper():
             move_target = _find_move_target(
                 graph, current_node_id, player, gate_node_id, terminal_node_ids,
                 weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
@@ -544,7 +539,8 @@ def _decide_action_impl(
                     return move_action
             return make_empty_action(match_id, round_num, player_id)
 
-        return _make_process_action(match_id, round_num, player_id, process_type, current_node_id, phase)
+        if process_type:
+            return _make_process_action(match_id, round_num, player_id, process_type, current_node_id, phase)
 
     if last_move_failed and last_move_error == "PROCESS_REQUIRED":
         process_type = _get_process_type(current_node, process_nodes, current_node_id)
@@ -552,13 +548,6 @@ def _decide_action_impl(
             logger.info("Round %d: PROCESS_REQUIRED at %s, sending %s", round_num, current_node_id, process_type)
             return _make_process_action(match_id, round_num, player_id, process_type, current_node_id, phase)
         return make_action(match_id, round_num, player_id, [make_process_action(current_node_id)])
-
-    # --- Handle OBJECT_BUSY: wait one round and retry ---
-    if last_move_failed and last_move_error == "OBJECT_BUSY":
-        # The process target is busy (e.g., window contest just ended, still transitioning)
-        # Wait one round, then retry process on next round
-        logger.info("Round %d: OBJECT_BUSY, waiting", round_num)
-        return make_action(match_id, round_num, player_id, [make_wait_action()])
 
     # --- Handle blocked movement ---
     if last_move_failed and last_move_error == "MOVE_BLOCKED_BY_GUARD":
@@ -591,7 +580,7 @@ def _decide_action_impl(
     if not force_delivery and dist_to_gate > 4:  # Only claim resources when not close to gate
         resource_action = _handle_resources(
             match_id, round_num, player_id, player, graph,
-            current_node_id, current_node, phase, weather,
+            current_node_id, current_node, phase, weather, gate_node_id,
         )
         if resource_action is not None:
             return resource_action
@@ -1153,9 +1142,39 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     task_score = get_task_score(player)
     if round_num >= 520:
         return True
+    if round_num >= 380 and task_score < TASK_SCORE_TARGET:
+        return True
     if round_num >= 400 and task_score >= TASK_SCORE_TARGET:
         return True
     if round_num >= 350 and task_score >= TASK_SCORE_STRETCH:
+        return True
+    return False
+
+
+def _should_skip_optional_task(
+    round_num: int,
+    phase: str,
+    template_id: str,
+    my_task_score: int,
+    graph: MapGraph,
+    current_node_id: str,
+    gate_node_id: str,
+    weather: dict | None,
+) -> bool:
+    """冲刺阶段跳过低性价比任务，优先交付竞速。"""
+    if phase == "RUSH" or round_num >= 400:
+        return True
+    dist = 999
+    if gate_node_id and current_node_id:
+        hops = graph.path_length(current_node_id, gate_node_id, weather, None)
+        if hops:
+            dist = hops
+    if template_id.startswith(("T12", "T13", "T14")):
+        if round_num >= 300 or dist <= 6:
+            return True
+    if template_id.startswith("T04") and (round_num >= 200 or my_task_score >= 30):
+        return True
+    if template_id.startswith("T08") and round_num >= 350 and my_task_score >= 30:
         return True
     return False
 
@@ -2030,6 +2049,18 @@ def _handle_tasks(
     )
     if task:
         template_id = get_task_template_id(task)
+        if _should_skip_optional_task(
+            round_num, phase, template_id, my_task_score,
+            graph, current_node_id, goal_node_id, weather,
+        ):
+            logger.info(
+                "Round %d: Skip optional task %s at %s (race priority)",
+                round_num, template_id, current_node_id,
+            )
+            task = None
+
+    if task:
+        template_id = get_task_template_id(task)
         if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
             logger.debug("Round %d: Skipping T06 task (no horse)", round_num)
             task = None
@@ -2093,6 +2124,7 @@ def _handle_resources(
     match_id: str, round_num: int, player_id: int,
     player: dict, graph: MapGraph, current_node_id: str,
     current_node: dict | None, phase: str, weather: dict | None,
+    gate_node_id: str = "",
 ) -> dict | None:
     """Handle resource claiming strategy (策略文档 §6).
 
@@ -2101,6 +2133,14 @@ def _handle_resources(
     if current_node is None:
         return None
     if phase == "RUSH" or round_num >= 360:
+        return None
+
+    dist_to_gate = 999
+    if graph and gate_node_id and current_node_id:
+        hops = graph.path_length(current_node_id, gate_node_id, weather, None)
+        if hops:
+            dist_to_gate = hops
+    if dist_to_gate <= 5:
         return None
 
     resources = find_available_resources(current_node)
