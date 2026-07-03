@@ -618,7 +618,7 @@ def _decide_action_impl(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
         processed_node_ids=processed_node_ids,
-        visited_node_ids=set() if force_delivery else visited_node_ids,
+        visited_node_ids=visited_node_ids,
         round_num=round_num,
     )
 
@@ -868,6 +868,57 @@ def _get_goal_node(
                     best = tid
         return best
     return None
+
+
+def _progress_cost_to_goal(
+    graph: MapGraph,
+    node_id: str,
+    goal: str,
+    weather: dict | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    obstacle_penalty_nodes: set[str] | None = None,
+) -> float:
+    """到宫门/终点的加权剩余耗时（越小越接近目标）。"""
+    if not node_id or not goal:
+        return float("inf")
+    if node_id == goal:
+        return 0.0
+    path = graph.weighted_shortest_path(node_id, goal, weather, None, process_nodes)
+    if not path:
+        return float("inf")
+    cost = graph.sum_path_cost(path, weather, None, process_nodes)
+    if obstacle_penalty_nodes:
+        for nid in path[1:]:
+            if nid in obstacle_penalty_nodes:
+                cost += 8
+    return cost
+
+
+def _is_forward_step(
+    graph: MapGraph,
+    current_node_id: str,
+    next_hop: str,
+    goal: str,
+    weather: dict | None = None,
+    process_nodes: dict[str, dict] | None = None,
+    obstacle_penalty_nodes: set[str] | None = None,
+) -> bool:
+    """下一跳必须缩短到目标的剩余路程（禁止往回跑）。"""
+    if not goal or not current_node_id or not next_hop:
+        return False
+    if current_node_id == next_hop:
+        return False
+    cur = _progress_cost_to_goal(
+        graph, current_node_id, goal, weather, process_nodes, obstacle_penalty_nodes,
+    )
+    nxt = _progress_cost_to_goal(
+        graph, next_hop, goal, weather, process_nodes, obstacle_penalty_nodes,
+    )
+    if cur == float("inf"):
+        return True
+    if nxt == float("inf"):
+        return False
+    return nxt < cur
 
 
 def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
@@ -1201,36 +1252,45 @@ def _find_move_target(
         safe = [n for n in available if n not in guard_blocked]
         if safe:
             available = safe
+
+    remaining_process_nodes = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
+    goal_node = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, remaining_process_nodes,
+    )
+    obstacle_penalty_nodes = set(obstacle_nodes)
+
+    # 禁止往回跑：只保留能缩短到目标路程的邻居
+    if goal_node:
+        progress_forward = [
+            n for n in available
+            if _is_forward_step(
+                graph, current_node_id, n, goal_node, weather,
+                remaining_process_nodes, obstacle_penalty_nodes,
+            )
+        ]
+        if progress_forward:
+            available = progress_forward
+        else:
+            logger.info(
+                "_find_move_target: no forward hop from %s toward %s, neighbors=%s",
+                current_node_id, goal_node, neighbors,
+            )
+            return None
+
     forward_available = [n for n in available if n not in visited_node_ids]
     if forward_available:
         available = forward_available
     logger.info("_find_move_target: current=%s neighbors=%s available=%s visited=%s failed_target=%s",
                 current_node_id, neighbors, available, visited_node_ids, failed_target)
     if not available:
-        # Fall back: allow backtrack but still avoid guarded nodes if possible
-        available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
-        if guard_blocked:
-            safe = [n for n in available if n not in guard_blocked]
-            if safe:
-                available = safe
-        if not available:
-            available = neighbors
-
-    remaining_process_nodes = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
-
-    goal_node = _get_goal_node(
-        player, gate_node_id, terminal_node_ids, graph,
-        current_node_id, weather, None, remaining_process_nodes,
-    )
+        return None
 
     if goal_node:
         # 路线比价：路障节点加 8 帧强过惩罚，但不阻断寻路（否则 rest=None 回退陆路）
         path_blocked: set[str] = set()
         obstacle_penalty_nodes = set(obstacle_nodes)
         soft_blocked = set(obstacle_nodes)
-        soft_blocked.update(visited_node_ids)
-        soft_blocked.update(guard_blocked)
-        soft_blocked.discard(goal_node)
 
         avoid_routes = _get_weather_penalized_routes(weather or {})
         log_compare = len(available) > 1
@@ -1726,7 +1786,14 @@ def _handle_tasks(
             ])
 
     # Look for nearby tasks within detour cost (策略文档 §5.2 顺路原则)
+    goal = _get_goal_node(
+        player, goal_node_id, terminal_node_ids, graph,
+        current_node_id, weather, blocked, process_nodes,
+    )
     if my_task_score < TASK_SCORE_TARGET:
+        current_progress = _progress_cost_to_goal(
+            graph, current_node_id, goal or goal_node_id, weather, process_nodes, obstacle_nodes,
+        ) if goal or goal_node_id else float("inf")
         candidates = []
         for task in tasks:
             if not task.get("active", False) or task.get("completed", False) or task.get("failed", False):
@@ -1755,6 +1822,17 @@ def _handle_tasks(
             if expire_round > 0 and round_num >= expire_round:
                 continue
 
+            # 不回退：任务点必须在当前位置之前（更靠近宫门）
+            if goal or goal_node_id:
+                task_goal = goal or goal_node_id
+                task_progress = _progress_cost_to_goal(
+                    graph, task_node, task_goal, weather, process_nodes, obstacle_nodes,
+                )
+                if task_progress >= current_progress:
+                    continue
+            if task_node in visited_node_ids:
+                continue
+
             # Check detour cost
             detour = _calc_detour_cost(graph, current_node_id, task_node, goal_node_id, terminal_node_ids, weather, blocked, player, process_nodes)
             if detour <= MAX_TASK_DETOUR_COST:
@@ -1771,14 +1849,28 @@ def _handle_tasks(
             candidates.sort(key=lambda x: (-x[2], x[1]))
             best_task = candidates[0][0]
             task_node = best_task.get("nodeId", "")
-            # Move toward the task node using weighted routing, avoid backtracking
+            task_goal = goal or goal_node_id
             soft_blocked = set(obstacle_nodes)
             soft_blocked.update(visited_node_ids)
-            soft_blocked.discard(task_node)  # Don't block the target
-            step = graph.next_step_toward(current_node_id, task_node, weather, soft_blocked, use_weighted=True, process_nodes=process_nodes)
+            soft_blocked.discard(task_node)
+            step = graph.next_step_toward(
+                current_node_id, task_node, weather, soft_blocked,
+                use_weighted=True, process_nodes=process_nodes,
+            )
             if not step:
-                # Fallback without soft-blocked
-                step = graph.next_step_toward(current_node_id, task_node, weather, obstacle_nodes, use_weighted=True, process_nodes=process_nodes)
+                step = graph.next_step_toward(
+                    current_node_id, task_node, weather, obstacle_nodes,
+                    use_weighted=True, process_nodes=process_nodes,
+                )
+            if step and task_goal and not _is_forward_step(
+                graph, current_node_id, step, task_goal, weather,
+                process_nodes, obstacle_nodes,
+            ):
+                logger.info(
+                    "Round %d: Skip backward task detour to %s via %s",
+                    round_num, task_node, step,
+                )
+                step = None
             if step:
                 logger.info("Round %d: Moving toward task at %s (template=%s), step=%s", round_num, task_node, get_task_template_id(best_task), step)
                 return make_action(match_id, round_num, player_id, [make_move_action(step)])
