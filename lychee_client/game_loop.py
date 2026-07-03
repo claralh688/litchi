@@ -42,6 +42,9 @@ class GameClient:
         self.failed_task_ids: set[str] = set()  # tasks rejected with RESOURCE_NOT_ENOUGH (skip retry)
         self.rush_speed_failed = False  # RUSH_SPEED rejected with INVALID_ACTION_TYPE (skip retry)
         self.last_claimed_task_id = ""  # track last CLAIM_TASK taskId for failed_task_ids
+        self.last_claimed_task_node_id = ""
+        self.pending_task_hold_node_id = ""
+        self.pending_task_hold_until_round = 0
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
         self.guard_stuck_target: str = ""
@@ -163,6 +166,9 @@ class GameClient:
         if current_node_id and current_node_id != self.last_node_id:
             if self.last_node_id and self.last_node_id in self.processed_node_ids:
                 self.processed_node_ids.discard(self.last_node_id)
+            if self.pending_task_hold_node_id and self.pending_task_hold_node_id != current_node_id:
+                self.pending_task_hold_node_id = ""
+                self.pending_task_hold_until_round = 0
             self.last_node_id = current_node_id
             self.visited_node_ids.add(current_node_id)
 
@@ -200,12 +206,27 @@ class GameClient:
                     # Note: actionResults doesn't include taskId, use last_claimed_task_id
                     if (
                         ar.get("action") == "CLAIM_TASK"
-                        and last_error in {"RESOURCE_NOT_ENOUGH", "TASK_REQUIREMENT_NOT_MET", "TASK_EXPIRED"}
+                        and last_error in {
+                            "RESOURCE_NOT_ENOUGH",
+                            "TASK_REQUIREMENT_NOT_MET",
+                            "TASK_EXPIRED",
+                            "WINDOW_DRAW_RETRY_LIMIT",
+                        }
                     ):
                         failed_tid = self.last_claimed_task_id
                         if failed_tid:
                             self.failed_task_ids.add(failed_tid)
+                            self.pending_task_hold_node_id = ""
+                            self.pending_task_hold_until_round = 0
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
+                    if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
+                        self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                        self.pending_task_hold_until_round = inquire.round + 6
+                        logger.info(
+                            "Round %d: Task %s busy at %s, holding until round %d",
+                            inquire.round, self.last_claimed_task_id,
+                            self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                        )
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
@@ -221,20 +242,34 @@ class GameClient:
             payload = ev.get("payload", {})
             if ev_type == "ACTION_REJECTED" and payload.get("playerId") == self.player_id:
                 last_error = payload.get("errorCode", last_error)
-                if last_error in ("PROCESS_REQUIRED", "MOVE_BLOCKED_BY_GUARD"):
-                    last_failed = True
+                last_failed = True
                 if last_error == "INVALID_ACTION_TYPE" and payload.get("action") == "RUSH_SPEED":
                     self.rush_speed_failed = True
                     logger.info("Round %d: RUSH_SPEED INVALID_ACTION_TYPE (from event), disabling", inquire.round)
                 # Track CLAIM_TASK business rejections from events.
                 if (
                     payload.get("action") == "CLAIM_TASK"
-                    and last_error in {"RESOURCE_NOT_ENOUGH", "TASK_REQUIREMENT_NOT_MET", "TASK_EXPIRED"}
+                    and last_error in {
+                        "RESOURCE_NOT_ENOUGH",
+                        "TASK_REQUIREMENT_NOT_MET",
+                        "TASK_EXPIRED",
+                        "WINDOW_DRAW_RETRY_LIMIT",
+                    }
                 ):
                     failed_tid = self.last_claimed_task_id
                     if failed_tid:
                         self.failed_task_ids.add(failed_tid)
+                        self.pending_task_hold_node_id = ""
+                        self.pending_task_hold_until_round = 0
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
+                if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
+                    self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                    self.pending_task_hold_until_round = inquire.round + 6
+                    logger.info(
+                        "Round %d: Task %s busy at %s (from event), holding until round %d",
+                        inquire.round, self.last_claimed_task_id,
+                        self.pending_task_hold_node_id, self.pending_task_hold_until_round,
+                    )
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
                 if last_error == "MOVE_BLOCKED_BY_GUARD":
@@ -338,6 +373,8 @@ class GameClient:
             rush_speed_failed=self.rush_speed_failed,
             guard_blocked_targets=self.guard_blocked_targets,
             avoid_route_nodes=self.avoid_route_nodes,
+            pending_task_hold_node_id=self.pending_task_hold_node_id,
+            pending_task_hold_until_round=self.pending_task_hold_until_round,
         )
 
         self.send_message(action_msg)
@@ -353,6 +390,7 @@ class GameClient:
         elif action_type == "CLAIM_TASK":
             action_detail = f"({actions[0].get('taskId', '?')})"
             self.last_claimed_task_id = actions[0].get("taskId", "")
+            self.last_claimed_task_node_id = current_node_id or ""
         if action_type == "MOVE":
             self.move_count += 1
         elif action_type in ("PROCESS", "DOCK", "VERIFY_GATE"):

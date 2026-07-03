@@ -106,6 +106,8 @@ def decide_action(
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
     avoid_route_nodes: set[str] | None = None,
+    pending_task_hold_node_id: str = "",
+    pending_task_hold_until_round: int = 0,
 ) -> dict:
     """Decide the action for the current round.
 
@@ -142,6 +144,7 @@ def decide_action(
             gate_node_id, terminal_node_ids, tasks, phase,
             processed_node_ids, visited_node_ids, weather, all_players, inquire_nodes,
             failed_task_ids, rush_speed_failed, guard_blocked_targets, avoid_route_nodes,
+            pending_task_hold_node_id, pending_task_hold_until_round,
         )
     except Exception as e:
         logger.error("Round %d: Strategy error: %s", round_num, e, exc_info=True)
@@ -174,6 +177,8 @@ def _decide_action_impl(
     rush_speed_failed: bool = False,
     guard_blocked_targets: set[str] | None = None,
     avoid_route_nodes: set[str] | None = None,
+    pending_task_hold_node_id: str = "",
+    pending_task_hold_until_round: int = 0,
 ) -> dict:
     if guard_blocked_targets is None:
         guard_blocked_targets = set()
@@ -250,6 +255,15 @@ def _decide_action_impl(
                 )
                 if task_retry is not None:
                     return task_retry
+                if (
+                    pending_task_hold_node_id == current_node_id
+                    and round_num <= pending_task_hold_until_round
+                ):
+                    logger.info(
+                        "Round %d: waiting for busy task at %s until %d",
+                        round_num, current_node_id, pending_task_hold_until_round,
+                    )
+                    return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if force_delivery and current_node_id and not next_node:
                 direct_target = _find_direct_delivery_step(
@@ -317,6 +331,17 @@ def _decide_action_impl(
 
     if current_node_id is None:
         return make_empty_action(match_id, round_num, player_id)
+
+    if (
+        not force_delivery
+        and pending_task_hold_node_id == current_node_id
+        and round_num <= pending_task_hold_until_round
+    ):
+        logger.info(
+            "Round %d: holding at %s for busy task until %d",
+            round_num, current_node_id, pending_task_hold_until_round,
+        )
+        return make_action(match_id, round_num, player_id, [make_wait_action()])
 
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
