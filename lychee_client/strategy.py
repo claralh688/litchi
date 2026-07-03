@@ -217,9 +217,14 @@ def _decide_action_impl(
         guard_target = _resolve_guard_block_target(player, route_blocked, guard_blocked_targets)
 
         if state == "WAITING":
+            next_node = player.get("nextNodeId", "")
+            if _is_waiting_for_station_process(current_node_id, next_node, process_nodes, processed_node_ids):
+                logger.info("Round %d: station process pending at %s, sending empty action", round_num, current_node_id)
+                return make_empty_action(match_id, round_num, player_id)
+
             if last_move_failed and last_move_error == "PROCESS_REQUIRED":
-                logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, wait for IDLE", round_num, current_node_id)
-                return make_action(match_id, round_num, player_id, [make_wait_action()])
+                logger.info("Round %d: PROCESS_REQUIRED in WAITING at %s, sending empty action", round_num, current_node_id)
+                return make_empty_action(match_id, round_num, player_id)
 
             if guard_target:
                 return _wait_and_weaken_guard(
@@ -231,7 +236,6 @@ def _decide_action_impl(
                 logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
                 return make_action(match_id, round_num, player_id, [make_wait_action()])
 
-            next_node = player.get("nextNodeId", "")
             if next_node:
                 if next_node in route_blocked:
                     return _wait_and_weaken_guard(
@@ -800,6 +804,21 @@ def _choose_window_card(
 
     # Default: abstain
     return "ABSTAIN"
+
+
+def _is_waiting_for_station_process(
+    current_node_id: str | None,
+    next_node_id: str,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+) -> bool:
+    if not current_node_id or next_node_id or not process_nodes:
+        return False
+    if current_node_id in processed_node_ids:
+        return False
+
+    process_type = process_nodes.get(current_node_id, {}).get("processType")
+    return bool(process_type) and not is_verify_process(process_type)
 
 
 def _resolve_guard_block_target(
