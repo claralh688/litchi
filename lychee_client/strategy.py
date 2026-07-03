@@ -1526,9 +1526,10 @@ def _handle_use_resources(
                 make_use_resource_action("ICE_BOX")
             ])
 
-    # Use FAST_HORSE when IDLE and about to start a long road move
-    # (策略文档 §6.1: 官道长途段起点; 疾行令与马互斥)
-    if has_resource(player, "FAST_HORSE"):
+    force_delivery = _should_force_delivery(round_num, phase, player)
+
+    # Save horse buffs for forced delivery; using them mid-route wastes the short duration.
+    if force_delivery and has_resource(player, "FAST_HORSE"):
         neighbors = graph.get_neighbors(current_node_id)
         for n in neighbors:
             if graph.get_edge_route_type(current_node_id, n) == "ROAD":
@@ -1537,8 +1538,7 @@ def _handle_use_resources(
                     make_use_resource_action("FAST_HORSE")
                 ])
 
-    # Use SHORT_HORSE for medium distances
-    if has_resource(player, "SHORT_HORSE") and not has_resource(player, "FAST_HORSE"):
+    if force_delivery and has_resource(player, "SHORT_HORSE") and not has_resource(player, "FAST_HORSE"):
         neighbors = graph.get_neighbors(current_node_id)
         if neighbors:
             logger.info("Round %d: Using SHORT_HORSE before move", round_num)
