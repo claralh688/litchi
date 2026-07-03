@@ -383,9 +383,7 @@ def _decide_action_impl(
                     inquire_nodes, guard_target, my_team_id,
                 )
 
-            if last_move_failed and last_move_error == "OBJECT_BUSY":
-                logger.info("Round %d: OBJECT_BUSY in WAITING, continue route", round_num)
-            elif last_move_failed and last_move_error == "MOVING_ACTION_FORBIDDEN":
+            if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
                 if force_delivery or round_num >= 300:
                     logger.info("Round %d: %s in WAITING, continue route", round_num, last_move_error)
                 else:
