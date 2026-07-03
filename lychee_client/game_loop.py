@@ -56,6 +56,7 @@ class GameClient:
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
+        self.came_from_node_id: str = ""  # 上一站（禁止立即掉头）
         self.start_round: int = 1
         self.running = False
 
@@ -170,6 +171,8 @@ class GameClient:
         # When leaving a node, remove it from processed_node_ids (§4.1: revisit requires re-process)
         # but keep it in visited_node_ids for navigation (avoid backtracking)
         if current_node_id and current_node_id != self.last_node_id:
+            if self.last_node_id:
+                self.came_from_node_id = self.last_node_id
             if self.last_node_id and self.last_node_id in self.processed_node_ids:
                 self.processed_node_ids.discard(self.last_node_id)
             if self.pending_task_hold_node_id and self.pending_task_hold_node_id != current_node_id:
@@ -453,6 +456,7 @@ class GameClient:
             failed_intel_targets=self.failed_intel_targets,
             scouted_node_ids=self.scouted_node_ids,
             bounties=inquire.bounties,
+            came_from_node_id=self.came_from_node_id,
         )
 
         self.send_message(action_msg)
