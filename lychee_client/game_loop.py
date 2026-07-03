@@ -525,8 +525,17 @@ class GameClient:
 
     def handle_over(self, over: OverMessage) -> None:
         """Handle over message."""
-        logger.info("Game over: %s, winner=%s, rounds=%d",
-                     over.result_type, over.winner_player_id, over.over_round)
+        score_parts = []
+        for p in over.players:
+            pid = p.get("playerId", "?")
+            score_parts.append(
+                f"p{pid}: total={p.get('totalScore', 0)} task={p.get('taskScore', 0)}"
+            )
+        logger.info(
+            "Game over: %s, winner=%s, rounds=%d%s",
+            over.result_type, over.winner_player_id, over.over_round,
+            f" ({', '.join(score_parts)})" if score_parts else "",
+        )
         self.running = False
 
     def run(self) -> None:
