@@ -39,7 +39,7 @@ from lychee_client.decision import (
     make_use_resource_action,
     make_squad_scout_action, make_squad_clear_action,
     make_squad_reinforce_action, make_squad_weaken_action,
-    make_rush_speed_action, make_rush_protect_action,
+    make_rush_protect_action,
 )
 
 logger = logging.getLogger("lychee_client.strategy")
@@ -297,6 +297,7 @@ def _decide_action_impl(
     # Don't use blocked_nodes as hard filter in BFS — it causes TARGET_NOT_REACHABLE
     # Instead, use weighted routing to prefer unblocked paths
     blocked_soft = route_blocked  # used for weighted routing and combat
+    force_delivery = _should_force_delivery(round_num, phase, player)
 
     # --- P1: Delivery flow (策略文档 §4.2 FSM) ---
 
@@ -371,23 +372,24 @@ def _decide_action_impl(
         )
 
     # --- P2/P3: Task strategy (策略文档 §5) ---
-    task_action = _handle_tasks(
-        match_id, round_num, player_id, player, graph,
-        current_node_id, tasks, player_id, phase, weather, blocked,
-        goal_node_id=gate_node_id, terminal_node_ids=terminal_node_ids,
-        obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
-        processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
-        failed_task_ids=failed_task_ids,
-    )
-    if task_action is not None:
-        return task_action
+    if not force_delivery:
+        task_action = _handle_tasks(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, tasks, player_id, phase, weather, blocked,
+            goal_node_id=gate_node_id, terminal_node_ids=terminal_node_ids,
+            obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
+            processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+            failed_task_ids=failed_task_ids,
+        )
+        if task_action is not None:
+            return task_action
 
     # --- P4: Resource strategy (策略文档 §6) ---
     # Skip resource claiming when close to gate (prioritize delivery)
     dist_to_gate = 0
     if gate_node_id:
         dist_to_gate = graph.path_length(current_node_id, gate_node_id, weather, None)
-    if dist_to_gate > 4:  # Only claim resources when not close to gate
+    if not force_delivery and dist_to_gate > 4:  # Only claim resources when not close to gate
         resource_action = _handle_resources(
             match_id, round_num, player_id, player, graph,
             current_node_id, current_node, phase, weather,
@@ -404,17 +406,18 @@ def _decide_action_impl(
         return use_res_action
 
     # --- P5: Combat (策略文档 §8) — guard, break, squad ---
-    combat_action = _handle_combat(
-        match_id, round_num, player_id, player, graph,
-        current_node_id, gate_node_id, terminal_node_ids,
-        weather, blocked_soft, mode, phase, inquire_nodes, opp_player,
-        obstacle_nodes=obstacle_nodes,
-        process_nodes=process_nodes,
-        visited_node_ids=visited_node_ids,
-        my_team_id=my_team_id,
-    )
-    if combat_action is not None:
-        return combat_action
+    if not force_delivery:
+        combat_action = _handle_combat(
+            match_id, round_num, player_id, player, graph,
+            current_node_id, gate_node_id, terminal_node_ids,
+            weather, blocked_soft, mode, phase, inquire_nodes, opp_player,
+            obstacle_nodes=obstacle_nodes,
+            process_nodes=process_nodes,
+            visited_node_ids=visited_node_ids,
+            my_team_id=my_team_id,
+        )
+        if combat_action is not None:
+            return combat_action
 
     # --- Rush tactics (策略文档 §10) ---
     rush_action = _handle_rush_tactics(
@@ -433,7 +436,8 @@ def _decide_action_impl(
     move_target = _find_move_target(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
-        processed_node_ids=processed_node_ids, visited_node_ids=visited_node_ids,
+        processed_node_ids=processed_node_ids,
+        visited_node_ids=set() if force_delivery else visited_node_ids,
     )
 
     # Next hop has enemy guard → break / forced pass / detour before MOVE
@@ -579,6 +583,15 @@ def _get_goal_node(
                     best = tid
         return best
     return None
+
+
+def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
+    """Stop optional scoring once delivery risk is higher than task/resource value."""
+    if phase == "RUSH":
+        return True
+    if round_num >= 360:
+        return True
+    return round_num >= 220 and get_task_score(player) >= TASK_SCORE_TARGET
 
 
 def _find_move_target(
@@ -1014,6 +1027,8 @@ def _handle_tasks(
         failed_task_ids = set()
 
     my_task_score = get_task_score(player)
+    if _should_force_delivery(round_num, phase, player):
+        return None
 
     # Already at stretch target, don't need more tasks
     if my_task_score >= TASK_SCORE_STRETCH and phase != "RUSH":
@@ -1160,6 +1175,8 @@ def _handle_resources(
     Returns action dict or None.
     """
     if current_node is None:
+        return None
+    if phase == "RUSH" or round_num >= 360:
         return None
 
     resources = find_available_resources(current_node)
@@ -1445,25 +1462,11 @@ def _handle_rush_tactics(
         return None
 
     freshness = get_freshness(player)
-    good_fruit = get_good_fruit(player)
 
     # RUSH_PROTECT: 鲜度<50, 停靠节点使用 (策略文档 §10: 0成本)
     if freshness < RUSH_PROTECT_FRESHNESS:
         logger.info("Round %d: Using RUSH_PROTECT (freshness=%.1f)", round_num, freshness)
         return make_action(match_id, round_num, player_id, [make_rush_protect_action()])
 
-    # RUSH_SPEED: 疾行令 (策略文档 §10: 2好果, 15帧×1300, 鲜度×1.25)
-    # Must have ≥3 good fruit (2 for RUSH_SPEED + 1 reserved for DELIVER)
-    # 与马互斥: 不在马上时才用
-    # Skip if previously rejected with INVALID_ACTION_TYPE (server may not support standalone RUSH_SPEED)
-    if (good_fruit >= 3
-            and freshness > 50
-            and not has_resource(player, "FAST_HORSE")
-            and not has_resource(player, "SHORT_HORSE")
-            and not rush_speed_failed):
-        logger.info("Round %d: Using RUSH_SPEED (standalone)", round_num)
-        return make_action(match_id, round_num, player_id, [
-            make_rush_speed_action(),
-        ])
-
+    # The current server rejects standalone RUSH_SPEED as INVALID_ACTION_TYPE.
     return None

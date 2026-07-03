@@ -196,13 +196,16 @@ class GameClient:
                     if last_error == "INVALID_ACTION_TYPE" and ar.get("action") == "RUSH_SPEED":
                         self.rush_speed_failed = True
                         logger.info("Round %d: RUSH_SPEED rejected as INVALID_ACTION_TYPE, disabling", inquire.round)
-                    # Track CLAIM_TASK rejected with RESOURCE_NOT_ENOUGH
+                    # Track CLAIM_TASK business rejections that should not be retried.
                     # Note: actionResults doesn't include taskId, use last_claimed_task_id
-                    if last_error == "RESOURCE_NOT_ENOUGH" and ar.get("action") == "CLAIM_TASK":
+                    if (
+                        ar.get("action") == "CLAIM_TASK"
+                        and last_error in {"RESOURCE_NOT_ENOUGH", "TASK_REQUIREMENT_NOT_MET", "TASK_EXPIRED"}
+                    ):
                         failed_tid = self.last_claimed_task_id
                         if failed_tid:
                             self.failed_task_ids.add(failed_tid)
-                            logger.info("Round %d: Task %s rejected (RESOURCE_NOT_ENOUGH), adding to failed list", inquire.round, failed_tid)
+                            logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
@@ -223,12 +226,15 @@ class GameClient:
                 if last_error == "INVALID_ACTION_TYPE" and payload.get("action") == "RUSH_SPEED":
                     self.rush_speed_failed = True
                     logger.info("Round %d: RUSH_SPEED INVALID_ACTION_TYPE (from event), disabling", inquire.round)
-                # Track CLAIM_TASK RESOURCE_NOT_ENOUGH from events
-                if last_error == "RESOURCE_NOT_ENOUGH" and payload.get("action") == "CLAIM_TASK":
+                # Track CLAIM_TASK business rejections from events.
+                if (
+                    payload.get("action") == "CLAIM_TASK"
+                    and last_error in {"RESOURCE_NOT_ENOUGH", "TASK_REQUIREMENT_NOT_MET", "TASK_EXPIRED"}
+                ):
                     failed_tid = self.last_claimed_task_id
                     if failed_tid:
                         self.failed_task_ids.add(failed_tid)
-                        logger.info("Round %d: Task %s RESOURCE_NOT_ENOUGH (from event), adding to failed list", inquire.round, failed_tid)
+                        logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
                 if last_error == "MOVE_BLOCKED_BY_GUARD":
