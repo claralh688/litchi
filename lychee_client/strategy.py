@@ -756,6 +756,7 @@ def _estimate_rest_route_cost(
     weather: dict | None,
     blocked: set[str],
     remaining_process_nodes: dict[str, dict] | None,
+    obstacle_penalty_nodes: set[str] | None = None,
 ) -> float | None:
     """估算从 from_node 到 goal 的后续路线耗时（宏观官道/水路语义）。
 
@@ -764,6 +765,22 @@ def _estimate_rest_route_cost(
     """
     if not remaining_process_nodes:
         remaining_process_nodes = {}
+    if obstacle_penalty_nodes is None:
+        obstacle_penalty_nodes = set()
+
+    def _edge_cost(from_id: str, to_id: str) -> float:
+        cost = graph.edge_cost(from_id, to_id, weather, blocked, remaining_process_nodes)
+        if to_id in obstacle_penalty_nodes:
+            cost += 8  # 路障处理站：强制通行时间税
+        return cost
+
+    def _sum_path(path: list[str]) -> float:
+        if len(path) < 2:
+            return 0.0
+        total = 0.0
+        for i in range(len(path) - 1):
+            total += _edge_cost(path[i], path[i + 1])
+        return total
 
     proc = remaining_process_nodes.get(from_node, {}).get("processType", "")
     board_nodes = _nodes_with_process_type(remaining_process_nodes, "BOARD", "DOCK")
@@ -772,9 +789,12 @@ def _estimate_rest_route_cost(
     if proc in ("BOARD", "DOCK") and water_transfer_nodes:
         best_cost = float("inf")
         for wt in water_transfer_nodes:
+            # 登船后优先走水路边到换运站（禁止把 S04→S07 陆路捷径算入水路）
             leg1 = graph.weighted_shortest_path(
                 from_node, wt, weather, blocked, remaining_process_nodes,
             )
+            if not leg1 and from_node in graph.get_neighbors(wt):
+                leg1 = [from_node, wt]
             if not leg1:
                 continue
             leg2 = graph.weighted_shortest_path(
@@ -782,10 +802,7 @@ def _estimate_rest_route_cost(
             )
             if not leg2:
                 continue
-            cost = (
-                graph.sum_path_cost(leg1, weather, blocked, remaining_process_nodes)
-                + graph.sum_path_cost(leg2, weather, blocked, remaining_process_nodes)
-            )
+            cost = _sum_path(leg1) + _sum_path(leg2)
             if cost < best_cost:
                 best_cost = cost
         if best_cost < float("inf"):
@@ -798,14 +815,14 @@ def _estimate_rest_route_cost(
         from_node, goal, weather, road_blocked, remaining_process_nodes,
     )
     if rest:
-        return graph.sum_path_cost(rest, weather, road_blocked, remaining_process_nodes)
+        return _sum_path(rest)
 
     rest = graph.weighted_shortest_path(
         from_node, goal, weather, blocked, remaining_process_nodes,
     )
     if not rest:
         return None
-    return graph.sum_path_cost(rest, weather, blocked, remaining_process_nodes)
+    return _sum_path(rest)
 
 
 def _get_process_type(
@@ -1085,31 +1102,37 @@ def _pick_cheapest_first_hop(
     goal_node: str,
     available: list[str],
     weather: dict | None,
-    soft_blocked: set[str],
+    path_blocked: set[str],
     remaining_process_nodes: dict[str, dict] | None,
     avoid_routes: set[str] | None = None,
     log_compare: bool = False,
+    obstacle_penalty_nodes: set[str] | None = None,
 ) -> str | None:
     """Compare each available neighbor by total weighted cost to goal.
 
-    对每条宏观路线（官道/水路/山路）估算「本跳 + 后续最短路」总耗时，
-    自动偏好 WATER(1250) 低于 ROAD(1380) 的边，不写死节点编号。
+    path_blocked 仅含道路障碍节点；visited/设卡不参与代价估算（否则会算不出路径）。
     """
     best_neighbor = None
     best_cost = float("inf")
     comparisons: list[tuple[str, float, str]] = []
+    if obstacle_penalty_nodes is None:
+        obstacle_penalty_nodes = set()
+    board_nodes = _nodes_with_process_type(remaining_process_nodes or {}, "BOARD", "DOCK")
 
     for n in available:
         route_type = graph.get_edge_route_type(current_node_id, n)
-        if avoid_routes and route_type in avoid_routes:
-            continue
         hop_cost = graph.edge_cost(
-            current_node_id, n, weather, soft_blocked, remaining_process_nodes,
+            current_node_id, n, weather, None, remaining_process_nodes,
         )
+        if n in obstacle_penalty_nodes:
+            hop_cost += 8
         if hop_cost == float("inf"):
             continue
+        if avoid_routes and route_type in avoid_routes:
+            hop_cost *= 1.35
         rest_cost = _estimate_rest_route_cost(
-            graph, n, goal_node, weather, soft_blocked, remaining_process_nodes,
+            graph, n, goal_node, weather, path_blocked, remaining_process_nodes,
+            obstacle_penalty_nodes,
         )
         if rest_cost is None:
             continue
@@ -1119,13 +1142,12 @@ def _pick_cheapest_first_hop(
             best_cost = total
             best_neighbor = n
 
-    if best_neighbor and len(comparisons) >= 2 and remaining_process_nodes:
-        board_nodes = _nodes_with_process_type(remaining_process_nodes, "BOARD", "DOCK")
+    if best_neighbor and len(comparisons) >= 2:
         comparisons.sort(key=lambda x: x[1])
         top_cost = comparisons[0][1]
-        # 耗时接近时优先走登船/水路入口（差 5 帧以内）
-        for nid, cost, rt in comparisons:
-            if cost - top_cost <= 5 and nid in board_nodes:
+        # 耗时接近时优先走登船/水路入口（差 8 帧以内）
+        for nid, cost, _rt in comparisons:
+            if cost - top_cost <= 8 and nid in board_nodes:
                 best_neighbor = nid
                 break
 
@@ -1194,12 +1216,7 @@ def _find_move_target(
         if not available:
             available = neighbors
 
-    remaining_process_nodes = None
-    if process_nodes:
-        remaining_process_nodes = {
-            nid: info for nid, info in process_nodes.items()
-            if nid not in processed_node_ids
-        }
+    remaining_process_nodes = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
 
     goal_node = _get_goal_node(
         player, gate_node_id, terminal_node_ids, graph,
@@ -1207,37 +1224,48 @@ def _find_move_target(
     )
 
     if goal_node:
-        # Build soft-blocked set: obstacles + visited + enemy guards
+        # 路线比价：路障节点加 8 帧强过惩罚，但不阻断寻路（否则 rest=None 回退陆路）
+        path_blocked: set[str] = set()
+        obstacle_penalty_nodes = set(obstacle_nodes)
         soft_blocked = set(obstacle_nodes)
         soft_blocked.update(visited_node_ids)
         soft_blocked.update(guard_blocked)
         soft_blocked.discard(goal_node)
 
         avoid_routes = _get_weather_penalized_routes(weather or {})
-        # 开局/分支点：逐邻居比较总加权耗时（宏观官道 vs 水路）
         log_compare = len(available) > 1
         step = _pick_cheapest_first_hop(
             graph, current_node_id, goal_node, available, weather,
-            soft_blocked, remaining_process_nodes, avoid_routes,
+            path_blocked, remaining_process_nodes, avoid_routes,
             log_compare=log_compare,
+            obstacle_penalty_nodes=obstacle_penalty_nodes,
         )
         if step:
             return step
 
-        # Fallback: Dijkstra 首跳
-        step = graph.next_step_toward(current_node_id, goal_node, weather, soft_blocked, use_weighted=True, process_nodes=remaining_process_nodes)
+        # Fallback: Dijkstra 首跳（实际移动仍不可进纯路障节点，由 available 过滤）
+        step = graph.next_step_toward(
+            current_node_id, goal_node, weather, obstacle_nodes,
+            use_weighted=True, process_nodes=remaining_process_nodes,
+        )
         if step and step in available:
             return step
-        # Fallback: unweighted BFS
-        step = graph.next_step_toward(current_node_id, goal_node, weather, soft_blocked, use_weighted=False)
+        step = graph.next_step_toward(
+            current_node_id, goal_node, weather, obstacle_nodes,
+            use_weighted=False, process_nodes=remaining_process_nodes,
+        )
         if step and step in available:
             return step
-        # Try weighted without soft-blocked (just obstacles)
-        step = graph.next_step_toward(current_node_id, goal_node, weather, obstacle_nodes, use_weighted=True, process_nodes=remaining_process_nodes)
+        step = graph.next_step_toward(
+            current_node_id, goal_node, weather, None,
+            use_weighted=True, process_nodes=remaining_process_nodes,
+        )
         if step and step in available:
             return step
-        # Try BFS without any filter
-        step = graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
+        step = graph.next_step_toward(
+            current_node_id, goal_node, weather, None,
+            use_weighted=False, process_nodes=remaining_process_nodes,
+        )
         if step and step in available:
             return step
 
