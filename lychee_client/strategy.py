@@ -287,10 +287,10 @@ def _decide_action_impl(
                 current_node_id, next_node, process_nodes, processed_node_ids,
             )
             if pending_process_type:
-                # 激进策略：WAITING 状态下，未完成的 process 必须先做，不能跳过
                 if _has_current_process_for_node(player, current_node_id):
                     logger.info("Round %d: station process running at %s, sending empty action", round_num, current_node_id)
                     return make_empty_action(match_id, round_num, player_id)
+                # OBJECT_BUSY 后必须跳过 process，不能再重试（否则卡死）
                 if last_move_failed and last_move_error == "OBJECT_BUSY":
                     logger.info(
                         "Round %d: station process busy at %s, skip %s and move on",
@@ -298,7 +298,8 @@ def _decide_action_impl(
                     )
                     if current_node_id:
                         processed_node_ids.add(current_node_id)
-                    if not next_node:
+                    # 无论 next_node 是否存在，都尝试 MOVE
+                    if current_node_id:
                         move_target = _find_move_target(
                             graph, current_node_id, player, gate_node_id, terminal_node_ids,
                             weather, route_blocked, obstacle_nodes=obstacle_nodes,
@@ -316,8 +317,10 @@ def _decide_action_impl(
                             )
                             if move_action is not None:
                                 return move_action
-                # 无论是否有 last_move_failed，都必须先完成 process
-                logger.info("Round %d: station process pending at %s, retrying %s (must complete)", round_num, current_node_id, pending_process_type)
+                    # 无法 MOVE 则空等
+                    return make_empty_action(match_id, round_num, player_id)
+                # 正常情况：重试 process
+                logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
                 return _make_process_action(
                     match_id, round_num, player_id,
                     pending_process_type, current_node_id, phase,
