@@ -496,6 +496,28 @@ def _decide_action_impl(
         # Not RUSH yet: don't submit VERIFY_GATE (will be rejected)
         # Continue doing other things until RUSH
 
+    # 验核后在宫门：优先前往终点交付
+    if (
+        gate_node_id
+        and current_node_id == gate_node_id
+        and is_verified(player)
+        and not is_delivered(player)
+        and terminal_node_ids
+    ):
+        for tid in terminal_node_ids:
+            if tid in graph.get_neighbors(current_node_id):
+                move_action = _emit_move_action(
+                    match_id, round_num, player_id, current_node_id, tid,
+                    graph, gate_node_id, terminal_node_ids, player, weather,
+                    process_nodes, processed_node_ids, obstacle_nodes,
+                    visited_node_ids, came_from_node_id,
+                )
+                if move_action is not None:
+                    logger.info("Round %d: Post-verify delivery move to %s", round_num, tid)
+                    return move_action
+                logger.info("Round %d: Direct delivery move to %s", round_num, tid)
+                return make_action(match_id, round_num, player_id, [make_move_action(tid)])
+
     # --- Fixed processing (策略文档 §4.1: 再次到达同一站需重新处理) ---
     # Process at current node ONLY if not already processed this visit.
     # processed_node_ids tracks nodes where we completed processing this session.
@@ -981,12 +1003,50 @@ def _nav_progress_goal(
     gate_node_id: str,
     terminal_node_ids: list[str],
 ) -> str | None:
-    """导航进度锚点：优先宫门，用于判断是否在朝目标前进。"""
+    """静态兜底锚点（未验核时指向宫门）。"""
     if gate_node_id:
         return gate_node_id
     if terminal_node_ids:
         return terminal_node_ids[0]
     return None
+
+
+def _resolve_nav_goal(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    graph: MapGraph,
+    current_node_id: str,
+    weather: dict | None = None,
+    process_nodes: dict[str, dict] | None = None,
+) -> str | None:
+    """动态导航目标：未验核→宫门；已验核→终点。"""
+    if is_delivered(player):
+        return None
+    goal = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, process_nodes,
+    )
+    if goal:
+        return goal
+    return _nav_progress_goal(gate_node_id, terminal_node_ids)
+
+
+def _is_gate_to_terminal_delivery(
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    current_node_id: str,
+    next_hop: str,
+) -> bool:
+    """验核后在宫门前往终点交付（合法前进，非掉头）。"""
+    return (
+        is_verified(player)
+        and bool(gate_node_id)
+        and current_node_id == gate_node_id
+        and bool(terminal_node_ids)
+        and next_hop in terminal_node_ids
+    )
 
 
 def _allow_revisit_gate(
@@ -1018,10 +1078,13 @@ def _is_allowed_move_step(
     *,
     allow_revisit_gate: bool = False,
     skip_visited_check: bool = False,
+    allow_gate_to_terminal: bool = False,
 ) -> bool:
-    """绝不允许掉头：禁止回上一站、禁止重入已访问节点、禁止远离宫门。"""
+    """绝不允许掉头：禁止回上一站、禁止重入已访问节点、禁止远离目标。"""
     if not next_hop or next_hop == current_node_id:
         return False
+    if allow_gate_to_terminal:
+        return not came_from_node_id or next_hop != came_from_node_id
     if came_from_node_id and next_hop == came_from_node_id:
         return False
     if not skip_visited_check and next_hop in visited_node_ids and not allow_revisit_gate:
@@ -1052,14 +1115,20 @@ def _emit_move_action(
     came_from_node_id: str,
 ) -> dict | None:
     remaining = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
-    nav_goal = _nav_progress_goal(gate_node_id, terminal_node_ids)
+    nav_goal = _resolve_nav_goal(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, remaining,
+    )
     allow_revisit = _allow_revisit_gate(
+        player, gate_node_id, terminal_node_ids, current_node_id, target_node_id,
+    )
+    gate_to_terminal = _is_gate_to_terminal_delivery(
         player, gate_node_id, terminal_node_ids, current_node_id, target_node_id,
     )
     skip_visited = (
         bool(gate_node_id)
-        and nav_goal == gate_node_id
         and current_node_id in terminal_node_ids
+        and nav_goal == gate_node_id
     )
     if not _is_allowed_move_step(
         graph, current_node_id, target_node_id, nav_goal,
@@ -1067,6 +1136,7 @@ def _emit_move_action(
         visited_node_ids, came_from_node_id,
         allow_revisit_gate=allow_revisit,
         skip_visited_check=skip_visited,
+        allow_gate_to_terminal=gate_to_terminal,
     ):
         logger.info(
             "Round %d: Blocked backtrack move %s -> %s (goal=%s, from=%s)",
@@ -1414,15 +1484,23 @@ def _find_move_target(
         player, gate_node_id, terminal_node_ids, graph,
         current_node_id, weather, None, remaining_process_nodes,
     )
-    nav_goal = _nav_progress_goal(gate_node_id, terminal_node_ids)
+    nav_goal = _resolve_nav_goal(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, remaining_process_nodes,
+    )
     obstacle_penalty_nodes = set(obstacle_nodes)
 
-    # 绝不允许掉头：禁止重入已访问节点、禁止回到上一站
-    available = [n for n in available if n not in visited_node_ids]
-    if came_from_node_id:
-        available = [n for n in available if n != came_from_node_id]
+    # 验核后在宫门：允许前往终点（终点不在 visited 里时也需保留）
+    delivery_hops = set()
+    if is_verified(player) and gate_node_id and current_node_id == gate_node_id:
+        delivery_hops = {n for n in available if n in terminal_node_ids}
 
-    # 禁止往回跑：只保留能缩短到宫门路程的邻居
+    # 绝不允许掉头：禁止重入已访问节点、禁止回到上一站
+    available = [n for n in available if n not in visited_node_ids or n in delivery_hops]
+    if came_from_node_id:
+        available = [n for n in available if n != came_from_node_id or n in delivery_hops]
+
+    # 禁止往回跑：只保留能缩短到当前目标路程的邻居
     progress_goal = nav_goal or goal_node
     if progress_goal:
         progress_forward = [
@@ -1434,6 +1512,8 @@ def _find_move_target(
         ]
         if progress_forward:
             available = progress_forward
+        elif delivery_hops:
+            available = [n for n in available if n in delivery_hops]
         else:
             logger.info(
                 "_find_move_target: no forward hop from %s toward %s, neighbors=%s",
