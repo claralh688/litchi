@@ -290,7 +290,6 @@ def _decide_action_impl(
                 if _has_current_process_for_node(player, current_node_id):
                     logger.info("Round %d: station process running at %s, sending empty action", round_num, current_node_id)
                     return make_empty_action(match_id, round_num, player_id)
-                # OBJECT_BUSY 后必须跳过 process，不能再重试（否则卡死）
                 if last_move_failed and last_move_error == "OBJECT_BUSY":
                     logger.info(
                         "Round %d: station process busy at %s, skip %s and move on",
@@ -298,8 +297,7 @@ def _decide_action_impl(
                     )
                     if current_node_id:
                         processed_node_ids.add(current_node_id)
-                    # 无论 next_node 是否存在，都尝试 MOVE
-                    if current_node_id:
+                    if not next_node:
                         move_target = _find_move_target(
                             graph, current_node_id, player, gate_node_id, terminal_node_ids,
                             weather, route_blocked, obstacle_nodes=obstacle_nodes,
@@ -317,14 +315,12 @@ def _decide_action_impl(
                             )
                             if move_action is not None:
                                 return move_action
-                    # 无法 MOVE 则空等
-                    return make_empty_action(match_id, round_num, player_id)
-                # 正常情况：重试 process
-                logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
-                return _make_process_action(
-                    match_id, round_num, player_id,
-                    pending_process_type, current_node_id, phase,
-                )
+                else:
+                    logger.info("Round %d: station process not started at %s, retrying %s", round_num, current_node_id, pending_process_type)
+                    return _make_process_action(
+                        match_id, round_num, player_id,
+                        pending_process_type, current_node_id, phase,
+                    )
 
             if last_move_failed and last_move_error == "PROCESS_REQUIRED":
                 process_type = process_nodes.get(current_node_id, {}).get("processType") if process_nodes and current_node_id else ""
@@ -341,7 +337,6 @@ def _decide_action_impl(
                 task_retry = _retry_task_at_current_node(
                     match_id, round_num, player_id, player, graph,
                     current_node_id, tasks, failed_task_ids,
-                    phase=phase, gate_node_id=gate_node_id, weather=weather,
                 )
                 if task_retry is not None:
                     return task_retry
@@ -1149,11 +1144,6 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     task_score = get_task_score(player)
     if round_num >= 520:
         return True
-    # 激进竞速：更早 force_delivery 确保 ≤430 帧送达
-    if round_num >= 320 and task_score < 60:
-        return True
-    if round_num >= 350 and task_score < TASK_SCORE_TARGET:
-        return True
     if round_num >= 380 and task_score < TASK_SCORE_TARGET:
         return True
     if round_num >= 400 and task_score >= TASK_SCORE_TARGET:
@@ -1173,8 +1163,8 @@ def _should_skip_optional_task(
     gate_node_id: str,
     weather: dict | None,
 ) -> bool:
-    """激进任务策略：早期必须领 T04/T08，任务分必须 ≥90 才能不折减。"""
-    if phase == "RUSH" or round_num >= 450:
+    """冲刺阶段跳过低性价比任务，优先交付竞速。"""
+    if phase == "RUSH" or round_num >= 400:
         return True
     dist = 999
     if gate_node_id and current_node_id:
@@ -1182,21 +1172,12 @@ def _should_skip_optional_task(
         if hops:
             dist = hops
     if template_id.startswith(("T12", "T13", "T14")):
-        if round_num >= 350 or dist <= 6:
+        if round_num >= 300 or dist <= 6:
             return True
-    # T04/T08 早期必须领，任务分 <60 时绝不跳过
-    if template_id.startswith("T04"):
-        if my_task_score >= 90:
-            return True
-        if round_num >= 400:
-            return True
-        return False
-    if template_id.startswith("T08"):
-        if my_task_score >= 60:
-            return True
-        if round_num >= 400:
-            return True
-        return False
+    if template_id.startswith("T04") and (round_num >= 200 or my_task_score >= 30):
+        return True
+    if template_id.startswith("T08") and round_num >= 350 and my_task_score >= 30:
+        return True
     return False
 
 
@@ -1511,9 +1492,13 @@ def _find_move_target(
     if not neighbors:
         return None
 
+    # Filter out failed target, obstacle nodes, and enemy-guarded nodes when alternatives exist
     guard_blocked = blocked or set()
-    # 先不过滤设卡：唯一前进方向被设卡挡住时仍需返回该跳，由上层攻坚/削弱
-    base_available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
+    available = [n for n in neighbors if n != failed_target and n not in obstacle_nodes]
+    if guard_blocked:
+        safe = [n for n in available if n not in guard_blocked]
+        if safe:
+            available = safe
 
     remaining_process_nodes = _remaining_fixed_process_nodes(process_nodes, processed_node_ids)
     goal_node = _get_goal_node(
@@ -1529,10 +1514,10 @@ def _find_move_target(
     # 验核后在宫门：允许前往终点（终点不在 visited 里时也需保留）
     delivery_hops = set()
     if is_verified(player) and gate_node_id and current_node_id == gate_node_id:
-        delivery_hops = {n for n in base_available if n in terminal_node_ids}
+        delivery_hops = {n for n in available if n in terminal_node_ids}
 
     # 绝不允许掉头：禁止重入已访问节点、禁止回到上一站
-    available = [n for n in base_available if n not in visited_node_ids or n in delivery_hops]
+    available = [n for n in available if n not in visited_node_ids or n in delivery_hops]
     if came_from_node_id:
         available = [n for n in available if n != came_from_node_id or n in delivery_hops]
 
@@ -1547,12 +1532,7 @@ def _find_move_target(
             )
         ]
         if progress_forward:
-            # 有无设卡替代路线时优先走畅通方向；唯一前进方向被设卡挡住则保留以便攻坚
-            if guard_blocked:
-                safe_forward = [n for n in progress_forward if n not in guard_blocked]
-                available = safe_forward if safe_forward else progress_forward
-            else:
-                available = progress_forward
+            available = progress_forward
         elif delivery_hops:
             available = [n for n in available if n in delivery_hops]
         else:
@@ -1971,9 +1951,6 @@ def _retry_task_at_current_node(
     current_node_id: str,
     tasks: list[dict],
     failed_task_ids: set[str],
-    phase: str = "",
-    gate_node_id: str = "",
-    weather: dict | None = None,
     preferred_task_id: str = "",
 ) -> dict | None:
     if get_task_score(player) >= TASK_SCORE_TARGET:
@@ -2013,11 +1990,6 @@ def _retry_task_at_current_node(
     if not task_id or task_id in failed_task_ids:
         return None
     template_id = get_task_template_id(task)
-    if _should_skip_optional_task(
-        round_num, phase, template_id, get_task_score(player),
-        graph, current_node_id, gate_node_id, weather,
-    ):
-        return None
     if template_id.startswith("T06") and not has_resource(player, "FAST_HORSE") and not has_resource(player, "SHORT_HORSE"):
         return None
     expire_round = task.get("expireRound", 0)
@@ -2411,25 +2383,6 @@ def _handle_use_resources(
             logger.info("Round %d: Using ICE_BOX (freshness=%.1f)", round_num, freshness)
             return make_action(match_id, round_num, player_id, [
                 make_use_resource_action("ICE_BOX")
-            ])
-
-    # 水路资源必用：S04/S05 领到 horse/boat 后必须立即使用（S05→S09 水路节省 10-20 帧）
-    water_route_nodes = {"S04", "S05"}
-    if current_node_id in water_route_nodes:
-        if has_resource(player, "FAST_HORSE"):
-            logger.info("Round %d: Using FAST_HORSE on water route at %s", round_num, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_use_resource_action("FAST_HORSE")
-            ])
-        if has_resource(player, "SHORT_HORSE") and not has_resource(player, "FAST_HORSE"):
-            logger.info("Round %d: Using SHORT_HORSE on water route at %s", round_num, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_use_resource_action("SHORT_HORSE")
-            ])
-        if has_resource(player, "BOAT_RIGHT"):
-            logger.info("Round %d: Using BOAT_RIGHT on water route at %s", round_num, current_node_id)
-            return make_action(match_id, round_num, player_id, [
-                make_use_resource_action("BOAT_RIGHT")
             ])
 
     # Save horse buffs for forced delivery; using them mid-route wastes the short duration.
