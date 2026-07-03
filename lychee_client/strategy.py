@@ -221,12 +221,17 @@ def _decide_action_impl(
     if deferred_scout is None:
         deferred_scout = []
 
+    obstacle_nodes: set[str] = set()
+    for node in inquire_nodes:
+        if node_has_obstacle(node):
+            obstacle_nodes.add(node.get("nodeId", ""))
+
     # --- 小分队探路（与主车队共用导航目标，不写死节点编号）---
     if phase != "RUSH" and not _should_force_delivery(round_num, phase, player):
         squad_scout = _pick_squad_scout_target(
             graph, get_current_node_id(player) or "", gate_node_id, terminal_node_ids,
             process_nodes, processed_node_ids, visited_node_ids, scouted_node_ids,
-            weather, player,
+            weather, player, obstacle_nodes,
         )
         if squad_scout:
             scout_item = make_squad_scout_action(squad_scout)
@@ -268,10 +273,6 @@ def _decide_action_impl(
     opp_player = _find_opponent(all_players, player_id)
     mode = classify_opponent_mode(player, opp_player, phase, gate_node_id)
 
-    obstacle_nodes: set[str] = set()
-    for node in inquire_nodes:
-        if node_has_obstacle(node):
-            obstacle_nodes.add(node.get("nodeId", ""))
     force_delivery = _should_force_delivery(round_num, phase, player)
 
     if is_in_limited_state(player):
@@ -735,6 +736,78 @@ def _remaining_fixed_process_nodes(
     }
 
 
+def _nodes_with_process_type(
+    process_nodes: dict[str, dict] | None,
+    *process_types: str,
+) -> set[str]:
+    if not process_nodes:
+        return set()
+    allowed = set(process_types)
+    return {
+        nid for nid, info in process_nodes.items()
+        if info.get("processType") in allowed
+    }
+
+
+def _estimate_rest_route_cost(
+    graph: MapGraph,
+    from_node: str,
+    goal: str,
+    weather: dict | None,
+    blocked: set[str],
+    remaining_process_nodes: dict[str, dict] | None,
+) -> float | None:
+    """估算从 from_node 到 goal 的后续路线耗时（宏观官道/水路语义）。
+
+    - 下一跳是登船站(BOARD/DOCK)：后续必须经水路换运(WATER_TRANSFER)，不能走 S04→S07 陆路捷径
+    - 官道分支：寻路时绕开未完成的登船站，避免误把陆路捷径算成「水路」
+    """
+    if not remaining_process_nodes:
+        remaining_process_nodes = {}
+
+    proc = remaining_process_nodes.get(from_node, {}).get("processType", "")
+    board_nodes = _nodes_with_process_type(remaining_process_nodes, "BOARD", "DOCK")
+    water_transfer_nodes = _nodes_with_process_type(remaining_process_nodes, "WATER_TRANSFER")
+
+    if proc in ("BOARD", "DOCK") and water_transfer_nodes:
+        best_cost = float("inf")
+        for wt in water_transfer_nodes:
+            leg1 = graph.weighted_shortest_path(
+                from_node, wt, weather, blocked, remaining_process_nodes,
+            )
+            if not leg1:
+                continue
+            leg2 = graph.weighted_shortest_path(
+                wt, goal, weather, blocked, remaining_process_nodes,
+            )
+            if not leg2:
+                continue
+            cost = (
+                graph.sum_path_cost(leg1, weather, blocked, remaining_process_nodes)
+                + graph.sum_path_cost(leg2, weather, blocked, remaining_process_nodes)
+            )
+            if cost < best_cost:
+                best_cost = cost
+        if best_cost < float("inf"):
+            return best_cost
+
+    road_blocked = set(blocked)
+    if from_node not in board_nodes:
+        road_blocked.update(board_nodes)
+    rest = graph.weighted_shortest_path(
+        from_node, goal, weather, road_blocked, remaining_process_nodes,
+    )
+    if rest:
+        return graph.sum_path_cost(rest, weather, road_blocked, remaining_process_nodes)
+
+    rest = graph.weighted_shortest_path(
+        from_node, goal, weather, blocked, remaining_process_nodes,
+    )
+    if not rest:
+        return None
+    return graph.sum_path_cost(rest, weather, blocked, remaining_process_nodes)
+
+
 def _get_process_type(
     current_node: dict | None,
     process_nodes: dict[str, dict] | None,
@@ -1035,26 +1108,34 @@ def _pick_cheapest_first_hop(
         )
         if hop_cost == float("inf"):
             continue
-        rest_path = graph.weighted_shortest_path(
-            n, goal_node, weather, soft_blocked, remaining_process_nodes,
+        rest_cost = _estimate_rest_route_cost(
+            graph, n, goal_node, weather, soft_blocked, remaining_process_nodes,
         )
-        if not rest_path:
+        if rest_cost is None:
             continue
-        total = hop_cost + graph.sum_path_cost(
-            rest_path, weather, soft_blocked, remaining_process_nodes,
-        )
+        total = hop_cost + rest_cost
         comparisons.append((n, total, route_type))
         if total < best_cost:
             best_cost = total
             best_neighbor = n
 
-    if log_compare and comparisons:
+    if best_neighbor and len(comparisons) >= 2 and remaining_process_nodes:
+        board_nodes = _nodes_with_process_type(remaining_process_nodes, "BOARD", "DOCK")
+        comparisons.sort(key=lambda x: x[1])
+        top_cost = comparisons[0][1]
+        # 耗时接近时优先走登船/水路入口（差 5 帧以内）
+        for nid, cost, rt in comparisons:
+            if cost - top_cost <= 5 and nid in board_nodes:
+                best_neighbor = nid
+                break
+
+    if log_compare and len(available) > 1:
         comparisons.sort(key=lambda x: x[1])
         logger.info(
             "route compare at %s -> %s: %s (pick %s)",
             current_node_id,
             goal_node,
-            ", ".join(f"{nid}={cost:.1f}({rt})" for nid, cost, rt in comparisons),
+            ", ".join(f"{nid}={cost:.1f}({rt})" for nid, cost, rt in comparisons) if comparisons else "none",
             best_neighbor,
         )
     return best_neighbor
@@ -1133,12 +1214,12 @@ def _find_move_target(
         soft_blocked.discard(goal_node)
 
         avoid_routes = _get_weather_penalized_routes(weather or {})
-        # 开局/分支点：逐邻居比较总加权耗时（含后续处理站），水路更快时自动选中
-        early_branch = round_num <= 80 or len(visited_node_ids) <= 4
+        # 开局/分支点：逐邻居比较总加权耗时（宏观官道 vs 水路）
+        log_compare = len(available) > 1
         step = _pick_cheapest_first_hop(
             graph, current_node_id, goal_node, available, weather,
             soft_blocked, remaining_process_nodes, avoid_routes,
-            log_compare=early_branch and len(available) > 1,
+            log_compare=log_compare,
         )
         if step:
             return step
@@ -1814,6 +1895,7 @@ def _pick_squad_scout_target(
     scouted_node_ids: set[str],
     weather: dict | None,
     player: dict,
+    obstacle_nodes: set[str] | None = None,
 ) -> str | None:
     """沿主路线下一未探路的固定处理站派出小分队。
 
@@ -1837,8 +1919,11 @@ def _pick_squad_scout_target(
     if not goal:
         return None
 
+    path_blocked = set(obstacle_nodes or [])
+    path_blocked.update(visited_node_ids)
+
     path = graph.weighted_shortest_path(
-        current_node_id, goal, weather, None, remaining,
+        current_node_id, goal, weather, path_blocked, remaining,
     )
     if path:
         for nid in path[1:]:
