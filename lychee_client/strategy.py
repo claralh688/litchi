@@ -433,6 +433,23 @@ def _decide_action_impl(
         return rush_action
 
     # --- NAVIGATION: Move toward goal ---
+    if force_delivery:
+        direct_target = _find_direct_delivery_step(
+            graph, current_node_id, player, gate_node_id, terminal_node_ids,
+            weather, process_nodes, processed_node_ids,
+        )
+        if direct_target:
+            if direct_target in route_blocked or direct_target in obstacle_nodes:
+                blocker_action = _handle_force_delivery_blocker(
+                    match_id, round_num, player_id, player,
+                    direct_target, inquire_nodes, tasks, failed_task_ids,
+                    obstacle_nodes, my_team_id,
+                )
+                if blocker_action.get("msg_data", {}).get("actions"):
+                    return blocker_action
+            logger.info("Round %d: FORCE_DELIVERY move to %s (goal=%s)", round_num, direct_target, gate_node_id)
+            return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
+
     move_target = _find_move_target(
         graph, current_node_id, player, gate_node_id, terminal_node_ids,
         weather, route_blocked, obstacle_nodes=obstacle_nodes, process_nodes=process_nodes,
@@ -592,6 +609,93 @@ def _should_force_delivery(round_num: int, phase: str, player: dict) -> bool:
     if round_num >= 360:
         return True
     return round_num >= 220 and get_task_score(player) >= TASK_SCORE_TARGET
+
+
+def _find_direct_delivery_step(
+    graph: MapGraph,
+    current_node_id: str,
+    player: dict,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    process_nodes: dict[str, dict] | None,
+    processed_node_ids: set[str],
+) -> str | None:
+    goal_node = _get_goal_node(
+        player, gate_node_id, terminal_node_ids, graph,
+        current_node_id, weather, None, process_nodes,
+    )
+    if not goal_node:
+        return None
+
+    remaining_process_nodes = None
+    if process_nodes:
+        remaining_process_nodes = {
+            nid: info for nid, info in process_nodes.items()
+            if nid not in processed_node_ids
+        }
+
+    # Ignore guards/obstacles here. If the direct next hop is blocked, handle
+    # that blocker explicitly instead of oscillating through detours.
+    step = graph.next_step_toward(
+        current_node_id, goal_node, weather, None,
+        use_weighted=True, process_nodes=remaining_process_nodes,
+    )
+    if step:
+        return step
+    return graph.next_step_toward(current_node_id, goal_node, weather, None, use_weighted=False)
+
+
+def _handle_force_delivery_blocker(
+    match_id: str,
+    round_num: int,
+    player_id: int,
+    player: dict,
+    target_node_id: str,
+    inquire_nodes: list[dict],
+    tasks: list[dict],
+    failed_task_ids: set[str],
+    obstacle_nodes: set[str],
+    my_team_id: str,
+) -> dict:
+    if target_node_id in obstacle_nodes:
+        t04_task = None
+        for task in tasks:
+            if (task.get("nodeId") == target_node_id
+                    and task.get("active", False)
+                    and not task.get("completed", False)
+                    and not task.get("failed", False)
+                    and get_task_template_id(task).startswith("T04")
+                    and task.get("taskId", "") not in failed_task_ids):
+                t04_task = task
+                break
+        if t04_task:
+            logger.info("Round %d: FORCE_DELIVERY T04 clear at %s", round_num, target_node_id)
+            return make_action(match_id, round_num, player_id, [
+                make_claim_task_action(t04_task.get("taskId", ""))
+            ])
+        if get_good_fruit(player) >= 2:
+            logger.info("Round %d: FORCE_DELIVERY CLEAR at %s", round_num, target_node_id)
+            return make_action(match_id, round_num, player_id, [make_clear_action(target_node_id)])
+        logger.info("Round %d: FORCE_DELIVERY forced pass obstacle at %s", round_num, target_node_id)
+        return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+
+    for node in inquire_nodes:
+        if node.get("nodeId") != target_node_id:
+            continue
+        guard = node.get("guard", {})
+        if is_enemy_guard(guard, my_team_id, player_id):
+            good = min(get_good_fruit(player), 2)
+            bad = min(get_bad_fruit(player), 2)
+            if good + bad > 0:
+                action = make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
+                logger.info("Round %d: FORCE_DELIVERY break guard at %s", round_num, target_node_id)
+                return make_action(match_id, round_num, player_id, [action])
+            logger.info("Round %d: FORCE_DELIVERY forced pass guard at %s", round_num, target_node_id)
+            return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
+
+    logger.info("Round %d: FORCE_DELIVERY forced pass blocked %s", round_num, target_node_id)
+    return make_action(match_id, round_num, player_id, [make_forced_pass_action(target_node_id)])
 
 
 def _find_move_target(
