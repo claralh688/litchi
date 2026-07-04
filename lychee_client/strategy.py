@@ -296,6 +296,15 @@ def _decide_action_impl(
 
             if next_node:
                 if next_node in route_blocked:
+                    # 被守卫卡住20+回合 → 改路绕行
+                    if avoid_route_nodes and next_node in avoid_route_nodes and current_node_id and graph:
+                        alt_target = _find_alternative_target(
+                            graph, current_node_id, next_node, gate_node_id, terminal_node_ids,
+                            weather, route_blocked, obstacle_nodes, player,
+                        )
+                        if alt_target:
+                            logger.info("Round %d: Stuck at %s for 20+ rounds, rerouting to %s", round_num, next_node, alt_target)
+                            return make_action(match_id, round_num, player_id, [make_move_action(alt_target)])
                     return _wait_and_weaken_guard(
                         match_id, round_num, player_id, player,
                         inquire_nodes, next_node, my_team_id,
@@ -1074,6 +1083,42 @@ def _resolve_guard_block_target(
     if next_node and next_node in route_blocked:
         return next_node
     return ""
+
+
+def _find_alternative_target(
+    graph: MapGraph,
+    current_node_id: str,
+    blocked_target: str,
+    gate_node_id: str,
+    terminal_node_ids: list[str],
+    weather: dict | None,
+    route_blocked: set[str],
+    obstacle_nodes: set[str],
+    player: dict,
+) -> str | None:
+    """当主路由被守卫阻挡时，找一个绕路的相邻节点。"""
+    goal = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None)
+    if not goal:
+        return None
+    neighbors = graph.get_neighbors(current_node_id)
+    best = None
+    best_cost = float('inf')
+    for n in neighbors:
+        if n == blocked_target or n in route_blocked or n in obstacle_nodes:
+            continue
+        path = graph.weighted_shortest_path(n, goal, weather, route_blocked)
+        if path:
+            cost = sum(graph.edge_cost(path[i], path[i+1], weather, route_blocked)
+                       for i in range(len(path)-1))
+            if cost < best_cost:
+                best_cost = cost
+                best = n
+    if best:
+        return best
+    for n in neighbors:
+        if n != blocked_target and n not in route_blocked and n not in obstacle_nodes:
+            return n
+    return None
 
 
 def _make_squad_weaken_action(
