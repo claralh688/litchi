@@ -48,15 +48,9 @@ class GameClient:
         self.pending_task_hold_until_round = 0
         self.guard_blocked_targets: set[str] = set()  # nodes blocked by enemy guard (for routing)
         self.avoid_route_nodes: set[str] = set()  # permanently avoided nodes after long guard stuck
-        self.forced_pass_failed_targets: set[str] = set()  # targets where blind forced pass was rejected this stop
-        self.failed_intel_targets: set[str] = set()  # INTEL targets rejected with TARGET_NOT_REACHABLE
-        self.scouted_node_ids: set[str] = set()  # nodes already sent SQUAD_SCOUT to
-        self.last_intel_target = ""
-        self.last_forced_pass_target = ""
         self.guard_stuck_target: str = ""
         self.guard_stuck_rounds: int = 0
         self.last_node_id: str = ""
-        self.came_from_node_id: str = ""  # 上一站（禁止立即掉头）
         self.start_round: int = 1
         self.running = False
 
@@ -171,16 +165,12 @@ class GameClient:
         # When leaving a node, remove it from processed_node_ids (§4.1: revisit requires re-process)
         # but keep it in visited_node_ids for navigation (avoid backtracking)
         if current_node_id and current_node_id != self.last_node_id:
-            if self.last_node_id:
-                self.came_from_node_id = self.last_node_id
             if self.last_node_id and self.last_node_id in self.processed_node_ids:
                 self.processed_node_ids.discard(self.last_node_id)
             if self.pending_task_hold_node_id and self.pending_task_hold_node_id != current_node_id:
                 self.pending_task_hold_task_id = ""
                 self.pending_task_hold_node_id = ""
                 self.pending_task_hold_until_round = 0
-            self.forced_pass_failed_targets.clear()
-            self.last_forced_pass_target = ""
             self.guard_blocked_targets.discard(current_node_id)
             self.avoid_route_nodes.discard(current_node_id)
             self.last_node_id = current_node_id
@@ -202,22 +192,6 @@ class GameClient:
                     "processType": pt,
                     "processRound": node.get("processRound", 0),
                 }
-            if nid and (nid in self.guard_blocked_targets or nid in self.avoid_route_nodes):
-                guard = node.get("guard", {}) or {}
-                owner_team = guard.get("ownerTeamId") or guard.get("teamId", "")
-                owner_player = guard.get("playerId")
-                is_enemy_active = (
-                    guard.get("active", True) is not False
-                    and guard.get("defense", 0) > 0
-                    and (
-                        (owner_team and owner_team != player.get("teamId", ""))
-                        or (owner_player is not None and owner_player != self.player_id)
-                    )
-                )
-                if not is_enemy_active:
-                    self.guard_blocked_targets.discard(nid)
-                    self.avoid_route_nodes.discard(nid)
-                    logger.info("Round %d: Guard at %s no longer blocks, clearing route block", inquire.round, nid)
 
         # Check last action result
         last_failed = False
@@ -234,13 +208,15 @@ class GameClient:
                         logger.info("Round %d: RUSH_SPEED rejected as INVALID_ACTION_TYPE, disabling", inquire.round)
                     # Track CLAIM_TASK business rejections that should not be retried.
                     # Note: actionResults doesn't include taskId, use last_claimed_task_id
-                    if ar.get("action") == "CLAIM_TASK" and last_error in {
+                    if (
+                        ar.get("action") == "CLAIM_TASK"
+                        and last_error in {
                             "RESOURCE_NOT_ENOUGH",
                             "TASK_REQUIREMENT_NOT_MET",
                             "TASK_EXPIRED",
                             "WINDOW_DRAW_RETRY_LIMIT",
-                            "TASK_NOT_FOUND",
-                        }:
+                        }
+                    ):
                         failed_tid = self.last_claimed_task_id
                         if failed_tid:
                             self.failed_task_ids.add(failed_tid)
@@ -249,53 +225,22 @@ class GameClient:
                             self.pending_task_hold_until_round = 0
                             logger.info("Round %d: Task %s rejected (%s), adding to failed list", inquire.round, failed_tid, last_error)
                     if ar.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                        failed_tid = self.last_claimed_task_id
-                        if failed_tid:
-                            self.failed_task_ids.add(failed_tid)
-                        self.pending_task_hold_task_id = ""
-                        self.pending_task_hold_node_id = ""
-                        self.pending_task_hold_until_round = 0
+                        self.pending_task_hold_task_id = self.last_claimed_task_id
+                        self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                        self.pending_task_hold_until_round = inquire.round + 6
                         logger.info(
-                            "Round %d: Task %s busy at %s, skip and move on",
-                            inquire.round, failed_tid or "?",
-                            self.last_claimed_task_node_id or current_node_id or "",
+                            "Round %d: Task %s busy at %s, holding until round %d",
+                            inquire.round, self.last_claimed_task_id,
+                            self.pending_task_hold_node_id, self.pending_task_hold_until_round,
                         )
-                    if ar.get("action") in ("PROCESS", "DOCK") and last_error == "OBJECT_BUSY":
-                        if current_node_id:
-                            self.processed_node_ids.add(current_node_id)
-                            logger.info(
-                                "Round %d: Process busy at %s, skip and continue route",
-                                inquire.round, current_node_id,
-                            )
                     if last_error == "PROCESS_REQUIRED" and current_node_id:
                         self.processed_node_ids.discard(current_node_id)
                         logger.info("Round %d: PROCESS_REQUIRED at %s, clearing processed flag", inquire.round, current_node_id)
-                    if (
-                        (ar.get("action") == "FORCED_PASS" or self.last_forced_pass_target)
-                        and last_error in {
-                        "TARGET_NOT_FOUND",
-                        "TARGET_NOT_REACHABLE",
-                        "ACTION_REJECTED",
-                        "FORCED_PASS_REPEAT",
-                        }
-                    ):
-                        target = ar.get("targetNodeId", "") or self.last_forced_pass_target
-                        if target:
-                            self.forced_pass_failed_targets.add(target)
-                            logger.info("Round %d: FORCED_PASS %s rejected (%s), will try normal move", inquire.round, target, last_error)
                     if last_error == "MOVE_BLOCKED_BY_GUARD":
                         target = ar.get("targetNodeId") or player.get("nextNodeId", "")
                         if target:
                             self.guard_blocked_targets.add(target)
                             logger.info("Round %d: Guard blocks %s, will reroute/break", inquire.round, target)
-                    if (
-                        ar.get("action") == "USE_RESOURCE"
-                        and last_error == "TARGET_NOT_REACHABLE"
-                    ):
-                        target = ar.get("targetNodeId", "") or self.last_intel_target
-                        if target:
-                            self.failed_intel_targets.add(target)
-                            logger.info("Round %d: INTEL target %s unreachable, blacklisting", inquire.round, target)
 
         # Also check events for rejections and cache contest info
         for ev in inquire.events:
@@ -315,7 +260,6 @@ class GameClient:
                         "TASK_REQUIREMENT_NOT_MET",
                         "TASK_EXPIRED",
                         "WINDOW_DRAW_RETRY_LIMIT",
-                        "TASK_NOT_FOUND",
                     }
                 ):
                     failed_tid = self.last_claimed_task_id
@@ -326,51 +270,20 @@ class GameClient:
                         self.pending_task_hold_until_round = 0
                         logger.info("Round %d: Task %s %s (from event), adding to failed list", inquire.round, failed_tid, last_error)
                 if payload.get("action") == "CLAIM_TASK" and last_error == "OBJECT_BUSY":
-                    failed_tid = self.last_claimed_task_id
-                    if failed_tid:
-                        self.failed_task_ids.add(failed_tid)
-                    self.pending_task_hold_task_id = ""
-                    self.pending_task_hold_node_id = ""
-                    self.pending_task_hold_until_round = 0
+                    self.pending_task_hold_task_id = self.last_claimed_task_id
+                    self.pending_task_hold_node_id = self.last_claimed_task_node_id or current_node_id or ""
+                    self.pending_task_hold_until_round = inquire.round + 6
                     logger.info(
-                        "Round %d: Task %s busy at %s (from event), skip and move on",
-                        inquire.round, failed_tid or "?",
-                        self.last_claimed_task_node_id or current_node_id or "",
+                        "Round %d: Task %s busy at %s (from event), holding until round %d",
+                        inquire.round, self.last_claimed_task_id,
+                        self.pending_task_hold_node_id, self.pending_task_hold_until_round,
                     )
-                if payload.get("action") in ("PROCESS", "DOCK") and last_error == "OBJECT_BUSY":
-                    if current_node_id:
-                        self.processed_node_ids.add(current_node_id)
-                        logger.info(
-                            "Round %d: Process busy at %s (from event), skip and continue",
-                            inquire.round, current_node_id,
-                        )
                 if last_error == "PROCESS_REQUIRED" and current_node_id:
                     self.processed_node_ids.discard(current_node_id)
-                if (
-                    (payload.get("action") == "FORCED_PASS" or self.last_forced_pass_target)
-                    and last_error in {
-                    "TARGET_NOT_FOUND",
-                    "TARGET_NOT_REACHABLE",
-                    "ACTION_REJECTED",
-                    "FORCED_PASS_REPEAT",
-                    }
-                ):
-                    target = payload.get("targetNodeId", "") or self.last_forced_pass_target
-                    if target:
-                        self.forced_pass_failed_targets.add(target)
-                        logger.info("Round %d: FORCED_PASS %s rejected from event (%s), will try normal move", inquire.round, target, last_error)
                 if last_error == "MOVE_BLOCKED_BY_GUARD":
                     target = payload.get("targetNodeId") or player.get("nextNodeId", "")
                     if target:
                         self.guard_blocked_targets.add(target)
-                if (
-                    payload.get("action") == "USE_RESOURCE"
-                    and last_error == "TARGET_NOT_REACHABLE"
-                ):
-                    target = payload.get("targetNodeId", "") or self.last_intel_target
-                    if target:
-                        self.failed_intel_targets.add(target)
-                        logger.info("Round %d: INTEL target %s unreachable (event), blacklisting", inquire.round, target)
             if ev_type == "GUARD_BREAK":
                 node_id = payload.get("nodeId") or payload.get("targetNodeId", "")
                 if node_id:
@@ -471,11 +384,6 @@ class GameClient:
             pending_task_hold_task_id=self.pending_task_hold_task_id,
             pending_task_hold_node_id=self.pending_task_hold_node_id,
             pending_task_hold_until_round=self.pending_task_hold_until_round,
-            forced_pass_failed_targets=self.forced_pass_failed_targets,
-            failed_intel_targets=self.failed_intel_targets,
-            scouted_node_ids=self.scouted_node_ids,
-            bounties=inquire.bounties,
-            came_from_node_id=self.came_from_node_id,
         )
 
         self.send_message(action_msg)
@@ -486,22 +394,12 @@ class GameClient:
         action_detail = ""
         if action_type == "MOVE":
             action_detail = f"->{actions[0].get('targetNodeId', '?')}"
-        elif action_type == "FORCED_PASS":
-            action_detail = f"->{actions[0].get('targetNodeId', '?')}"
         elif action_type == "CLAIM_RESOURCE":
             action_detail = f"({actions[0].get('resourceType', '?')})"
         elif action_type == "CLAIM_TASK":
             action_detail = f"({actions[0].get('taskId', '?')})"
             self.last_claimed_task_id = actions[0].get("taskId", "")
             self.last_claimed_task_node_id = current_node_id or ""
-        self.last_forced_pass_target = actions[0].get("targetNodeId", "") if action_type == "FORCED_PASS" else ""
-        if action_type == "USE_RESOURCE" and actions[0].get("resourceType") == "INTEL":
-            self.last_intel_target = actions[0].get("targetNodeId", "")
-        for act in actions:
-            if act.get("action") == "SQUAD_SCOUT":
-                target = act.get("targetNodeId", "")
-                if target:
-                    self.scouted_node_ids.add(target)
         if action_type == "MOVE":
             self.move_count += 1
         elif action_type in ("PROCESS", "DOCK", "VERIFY_GATE"):

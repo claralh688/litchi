@@ -24,30 +24,21 @@ ROUTE_FRESHNESS_LOSS = {
     "BRANCH": 0.065,
 }
 
-# Weather movement penalty multipliers (任务书 §2.3.2 / §2.5)
-# 酷暑 HOT 不影响通行倍率(1000)，只影响鲜度系数×1.5
+# Weather penalty multipliers (策略文档 §3.2)
 WEATHER_ROUTE_PENALTY = {
-    "HEAVY_RAIN": {"WATER": 1.35},    # 暴雨水路: 通行倍率 1350
-    "MOUNTAIN_FOG": {"MOUNTAIN": 1.1},  # 山雾山路: 通行倍率 1100
+    "HOT": {"MOUNTAIN": 1.5, "ROAD": 1.2},     # 酷暑: 山路鲜度×1.5
+    "HEAVY_RAIN": {"WATER": 1.5},               # 暴雨: 水路耗时×1.5
+    "MOUNTAIN_FOG": {"MOUNTAIN": 1.3},           # 山雾: 山路耗时×1.3
 }
-
-# 鲜度导向换路：酷暑时山路鲜度损耗×1.5，寻路加权惩罚（非移动倍率）
-WEATHER_FRESHNESS_ROUTE_PENALTY = {
-    "HOT": {"MOUNTAIN": 1.4, "BRANCH": 1.2},
-}
-
-# 暴雨命中时登船/水路换运处理 +4 帧 (任务书 §2.5)
-RAIN_EXTRA_PROCESS_TYPES = {"BOARD", "WATER_TRANSFER"}
-RAIN_EXTRA_PROCESS_FRAMES = 4
 
 # Process type cost in frames (策略文档 §4.1)
 PROCESS_COST_FRAMES = {
-    "TRANSFER": 4,
-    "BOARD": 7,
-    "WATER_TRANSFER": 6,
-    "PASS_TRANSFER": 5,
-    "PALACE_TRANSFER": 5,
-    "VERIFY": 6,
+    "TRANSFER": 4,         # S02 前段交接
+    "BOARD": 7,            # S04 登船
+    "WATER_TRANSFER": 6,   # S05 水路换运
+    "PASS_TRANSFER": 5,    # S11 入关交接
+    "PALACE_TRANSFER": 5,  # S13 宫前交接
+    "VERIFY": 6,           # S14 宫门验核
 }
 
 # Process cost penalty for route selection — directly in frame units
@@ -156,34 +147,30 @@ class MapGraph:
         # Cost in frame units: distance * routeCostFactor / 1000
         base_cost = distance * base_factor / 1000
 
-        # Apply weather movement penalty (任务书 §2.5: HOT 不影响通行倍率)
+        # Apply weather penalty (协议: region=ALL/WATER/MOUNTAIN + type=HOT/HEAVY_RAIN/MOUNTAIN_FOG)
         if weather:
             weather_events = list(weather.get("active", [])) + list(weather.get("forecast", []))
             for fw in weather_events:
                 weather_type = fw.get("type", "")
                 region = fw.get("region", "")
                 route_penalties = WEATHER_ROUTE_PENALTY.get(weather_type, {})
-                if route_penalties:
-                    if region in ("WATER", "HEAVY_RAIN") and route_type == "WATER":
-                        base_cost *= route_penalties.get("WATER", 1.0)
-                    elif region in ("MOUNTAIN", "MOUNTAIN_FOG") and route_type == "MOUNTAIN":
-                        base_cost *= route_penalties.get("MOUNTAIN", 1.0)
-                freshness_penalties = WEATHER_FRESHNESS_ROUTE_PENALTY.get(weather_type, {})
-                if freshness_penalties and route_type in freshness_penalties:
-                    if region in ("ALL", "HOT", weather_type):
-                        base_cost *= freshness_penalties[route_type]
+                if not route_penalties:
+                    continue
+                if region == "ALL" or region == weather_type:
+                    if route_type in route_penalties:
+                        base_cost *= route_penalties[route_type]
+                elif region == "WATER" and route_type == "WATER":
+                    if route_type in route_penalties:
+                        base_cost *= route_penalties[route_type]
+                elif region == "MOUNTAIN" and route_type == "MOUNTAIN":
+                    if route_type in route_penalties:
+                        base_cost *= route_penalties[route_type]
 
-        # Add process cost penalty for the target node (含暴雨处理加时)
+        # Add process cost penalty for the target node
         if process_nodes and to_id in process_nodes:
             pt = process_nodes[to_id].get("processType", "")
-            proc_cost = PROCESS_COST_PENALTY.get(pt, 0)
-            if proc_cost and weather:
-                for fw in list(weather.get("active", [])) + list(weather.get("forecast", [])):
-                    if fw.get("type") == "HEAVY_RAIN" and pt in RAIN_EXTRA_PROCESS_TYPES:
-                        if fw.get("region") in ("WATER", "HEAVY_RAIN", "ALL"):
-                            proc_cost += RAIN_EXTRA_PROCESS_FRAMES
-                            break
-            base_cost += proc_cost
+            if pt in PROCESS_COST_PENALTY:
+                base_cost += PROCESS_COST_PENALTY[pt]
 
         return base_cost
 
@@ -266,22 +253,6 @@ class MapGraph:
                     heapq.heappush(heap, (new_dist, neighbor))
         return []
 
-    def sum_path_cost(
-        self, path: list[str],
-        weather: dict | None = None,
-        blocked_nodes: set[str] | None = None,
-        process_nodes: dict[str, dict] | None = None,
-    ) -> float:
-        """Sum weighted edge costs along a path (frame-equivalent units)."""
-        if len(path) < 2:
-            return 0.0
-        total = 0.0
-        for i in range(len(path) - 1):
-            total += self.edge_cost(
-                path[i], path[i + 1], weather, blocked_nodes, process_nodes,
-            )
-        return total
-
     def next_step_toward(
         self, from_id: str, to_id: str,
         weather: dict | None = None,
@@ -309,14 +280,3 @@ class MapGraph:
         """Return the number of hops in the shortest path, or infinity if unreachable."""
         path = self.shortest_path(from_id, to_id, weather, blocked_nodes)
         return len(path) - 1 if path else float('inf')
-
-    def route_distance(self, from_id: str, to_id: str) -> int:
-        """沿最短路线边累计距离（任务书 §3.3.4 情报距离口径）。"""
-        path = self.shortest_path(from_id, to_id)
-        if not path or len(path) < 2:
-            return 999
-        total = 0
-        for i in range(len(path) - 1):
-            edge = self.get_edge(path[i], path[i + 1])
-            total += int(edge.get("distance", 30) if edge else 30)
-        return total
