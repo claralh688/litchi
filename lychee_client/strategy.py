@@ -281,12 +281,6 @@ def _decide_action_impl(
                     weather, process_nodes, processed_node_ids,
                 )
                 if direct_target:
-                    if direct_target in route_blocked or direct_target in obstacle_nodes:
-                        return _handle_force_delivery_blocker(
-                            match_id, round_num, player_id, player,
-                            direct_target, inquire_nodes, tasks, failed_task_ids,
-                            obstacle_nodes, my_team_id,
-                        )
                     logger.info("Round %d: FORCE_DELIVERY move to %s (WAITING)", round_num, direct_target)
                     return make_action(match_id, round_num, player_id, [make_move_action(direct_target)])
 
@@ -295,6 +289,10 @@ def _decide_action_impl(
                     match_id, round_num, player_id, player,
                     inquire_nodes, guard_target, my_team_id,
                 )
+
+            if last_move_failed and last_move_error in ("OBJECT_BUSY", "MOVING_ACTION_FORBIDDEN"):
+                logger.info("Round %d: %s in WAITING, sending WAIT", round_num, last_move_error)
+                return make_action(match_id, round_num, player_id, [make_wait_action()])
 
             if next_node:
                 if next_node in route_blocked:
@@ -513,6 +511,31 @@ def _decide_action_impl(
             weather, process_nodes, processed_node_ids,
         )
         if direct_target:
+            # Proactively check the full path ahead for enemy guards
+            goal = _get_goal_node(player, gate_node_id, terminal_node_ids, graph, current_node_id, weather, None, process_nodes)
+            if goal:
+                path = graph.weighted_shortest_path(current_node_id, goal, weather, None, process_nodes)
+                if path:
+                    for path_node in path[1:]:
+                        if path_node == current_node_id:
+                            continue
+                        for inq_node in inquire_nodes:
+                            if inq_node.get("nodeId") != path_node:
+                                continue
+                            guard = inq_node.get("guard", {})
+                            if is_enemy_guard(guard, my_team_id, player_id):
+                                good = min(get_good_fruit(player), 2)
+                                bad = min(get_bad_fruit(player), 2)
+                                if good + bad > 0:
+                                    logger.info("Round %d: FORCE_DELIVERY proactive break guard at %s", round_num, path_node)
+                                    return make_action(match_id, round_num, player_id, [
+                                        make_break_guard_action(path_node, good_fruit=good, bad_fruit=bad)
+                                    ])
+                                logger.info("Round %d: FORCE_DELIVERY proactive forced pass at %s", round_num, path_node)
+                                return make_action(match_id, round_num, player_id, [
+                                    make_forced_pass_action(path_node)
+                                ])
+
             if direct_target in route_blocked or direct_target in obstacle_nodes:
                 blocker_action = _handle_force_delivery_blocker(
                     match_id, round_num, player_id, player,
@@ -1085,16 +1108,10 @@ def _wait_and_weaken_guard(
 ) -> dict:
     """WAIT (主车队) + SQUAD_WEAKEN (小分队) 每帧削弱设卡直到通行。
     
-    Squad不足时fallback到BREAK_GUARD/FORCED_PASS，避免无限WAIT。
-    ICE_BOX在等待期间主动使用以保持鲜度。
+    注意：WAITING状态下服务器会拒绝所有非WAIT动作（MOVING_ACTION_FORBIDDEN），
+    包括 BREAK_GUARD / USE_RESOURCE / MOVE。
+    唯一正确做法是发 WAIT 等待状态机自动恢复。
     """
-    freshness = get_freshness(player)
-    if has_resource(player, "ICE_BOX") and freshness < 80:
-        logger.info("Round %d: Using ICE_BOX while guard waiting at %s (freshness=%.1f)", round_num, target_node_id, freshness)
-        return make_action(match_id, round_num, player_id, [
-            make_use_resource_action("ICE_BOX")
-        ])
-
     msg = make_action(match_id, round_num, player_id, [make_wait_action()])
     squad = _make_squad_weaken_action(
         inquire_nodes, target_node_id, my_team_id, player_id, player,
@@ -1102,18 +1119,7 @@ def _wait_and_weaken_guard(
     if squad:
         logger.info("Round %d: WAIT + squad weaken at %s", round_num, target_node_id)
         return _append_squad_action(msg, squad)
-
-    good = min(get_good_fruit(player), 2)
-    bad = min(get_bad_fruit(player), 2)
-    if good + bad > 0:
-        logger.info("Round %d: Squad exhausted, breaking guard at %s (good=%d bad=%d)", round_num, target_node_id, good, bad)
-        return make_action(match_id, round_num, player_id, [
-            make_break_guard_action(target_node_id, good_fruit=good, bad_fruit=bad)
-        ])
-    logger.info("Round %d: No fruit, forced pass at %s", round_num, target_node_id)
-    return make_action(match_id, round_num, player_id, [
-        make_forced_pass_action(target_node_id)
-    ])
+    return msg
 
 
 def _handle_moving(
